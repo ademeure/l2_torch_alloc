@@ -6,7 +6,7 @@ import time
 
 # Load the allocator
 new_alloc = torch.cuda.memory.CUDAPluggableAllocator(
-    './alloc.so', 'my_malloc', 'my_free')
+    './alloc.so', 'sideaware_malloc', 'sideaware_free')
 # # Swap the current allocator
 torch.cuda.memory.change_current_allocator(new_alloc)
 
@@ -70,10 +70,11 @@ def sideaware_memcpy(dst: torch.Tensor, src: torch.Tensor) -> None:
     size_in_bytes = src.numel() * src.element_size()
 
     # Get the current CUDA stream
-    stream_ptr = torch.cuda.current_stream().cuda_stream
+    device = torch.cuda.current_device()
+    stream = torch.cuda.current_stream(device)
 
     # Call our C function
-    alloc_lib.sideaware_memcpy(dst_ptr, src_ptr, size_in_bytes, stream_ptr)
+    alloc_lib.sideaware_memcpy(dst_ptr, src_ptr, size_in_bytes, device, stream)
 
 # Manually define the PyTorch operator
 #
@@ -169,7 +170,7 @@ def test_memcpy_correctness(shape, dtype=torch.float32, run_benchmark=False):
 
     # Copy using our manual memcpy
     if run_benchmark:
-        for i in range(2):
+        for i in range(3):
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
 
