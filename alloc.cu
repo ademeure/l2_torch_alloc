@@ -136,7 +136,7 @@ struct DeviceContext {
 // The wrapper function calling this is defined at the very end (needs access to other variables)
 // ---------------------------------------------------------------------------
 
-template<bool input_aligned_2mib=false, typename size_type=size_t, int FORCED_UNROLL=4>
+template<bool input_aligned_2mib=false, int FORCED_UNROLL=4, typename size_type=size_t>
 __global__ __launch_bounds__(1024, 1, 1) void side_aware_memcpy(uint4 * __restrict__ output,
                                                                 const uint4 * __restrict__ input,
                                                                 size_type num_bytes, int hash, int num_sm_per_side,
@@ -215,7 +215,6 @@ __global__ __launch_bounds__(1024, 1, 1) void side_aware_memcpy(uint4 * __restri
         int idx = sm_side_index - start_sm_side_idx;
         if (idx >= 0) {
             size_type byte_offset = (idx + multi_chunks * FORCED_UNROLL) * (2 * CHUNK_SIZE) + group_tid * 16;
-            // Determine the side of the 1st 4KiB chunk in the 8KiB "double chunk"
             int lsb_side_bits = (((input_aligned_2mib ? 0 : input_base) + (byte_offset & 0xFFFFFFFF)) & hash);
             int side = (__popc(lsb_side_bits) & 1);
             if (side != sm_side) {
@@ -224,10 +223,8 @@ __global__ __launch_bounds__(1024, 1, 1) void side_aware_memcpy(uint4 * __restri
             if (byte_offset + sizeof(uint4) <= num_bytes) {
                 output[byte_offset / sizeof(uint4)] = input[byte_offset / sizeof(uint4)];
             }
-            return;
-        }
-        // Process the final partial uint4 (when the number of bytes is not a multiple of 16)
-        if (sm_side_index == (num_sm_per_side - 1) && sm_side == 0 && (num_bytes % sizeof(uint4) != 0)) {
+        } else if (idx == -1 && sm_side == 0) {
+            // Process the final partial uint4 (when the number of bytes is not a multiple of 16)
             size_type byte_offset = threadIdx.x + num_bytes - (num_bytes % sizeof(uint4));
             if(byte_offset < num_bytes) {
                 ((unsigned char*)output)[byte_offset] = ((unsigned char*)input)[byte_offset];

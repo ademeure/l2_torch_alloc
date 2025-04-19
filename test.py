@@ -203,17 +203,17 @@ def test_memcpy_correctness(shape, dtype=torch.float32, run_benchmark=False):
         diff_indices = (dst_manual != dst_builtin).nonzero()
         sample_idx = diff_indices[0].tolist()
         print(f"First difference at index {sample_idx}")
-        print(f"Manual value: {dst_manual[sample_idx]}")
-        print(f"Built-in value: {dst_builtin[sample_idx]}")
+        print(f"!!! Manual value: {dst_manual[tuple(sample_idx)]}")
+        print(f"!!! Built-in value: {dst_builtin[tuple(sample_idx)]}")
 
     return is_equal
 
 # Test with increasing sizes
-test_memcpy_correctness((1000, 1000), run_benchmark=True)  # Medium: 4 MB
-test_memcpy_correctness((5000, 1000))  # Large: 20 MB
+test_memcpy_correctness((2, 7777))  # Small: <64KiB (not multiple of 16 bytes!)
+test_memcpy_correctness((100000, 15000))  # Huge: 6 GB
 
 # Test different dtypes
-test_memcpy_correctness((1000, 1000), dtype=torch.int32)
+test_memcpy_correctness((1000, 1000), dtype=torch.int16)
 test_memcpy_correctness((1000, 1000), dtype=torch.float64)
 
 # Test with a very large tensor and run benchmark
