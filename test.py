@@ -25,8 +25,19 @@ for func_name in ['get_num_sm_side0', 'get_num_sm_side1', 'get_min_sm_per_side',
     getattr(alloc_lib, func_name).restype = ctypes.c_int
 
 # Setup sideaware_memcpy function (this is what gets called as torch.ops.sideaware.memcpy)
-alloc_lib.sideaware_memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+# void sideaware_memcpy(void* dst, const void* src, size_t size, int device, cudaStream_t stream)
+alloc_lib.sideaware_memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
 alloc_lib.sideaware_memcpy.restype = None
+
+# Expose function to update the custom NVRTC header (triggers recompilation on next call)
+# sideaware_set_custom_header returns int header_id
+alloc_lib.sideaware_set_custom_header.argtypes = [ctypes.c_char_p]
+alloc_lib.sideaware_set_custom_header.restype = ctypes.c_int
+
+# elementwise (generic) API
+alloc_lib.sideaware_elementwise = alloc_lib.sideaware_elementwise
+alloc_lib.sideaware_elementwise.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+alloc_lib.sideaware_elementwise.restype = None
 
 # Helper function to get SM side & index as a PyTorch tensor
 def get_sm_side_index_tensor():
@@ -107,6 +118,29 @@ print(f"Before memcpy - src: {src_tensor[0, 0]} & {src_tensor[9, 9]}, dst: {dst_
 # Call our custom op
 torch.ops.sideaware.memcpy(dst_tensor, src_tensor)
 print(f"After memcpy - src: {src_tensor[0, 0]} & {src_tensor[9, 9]}, dst: {dst_tensor[0, 0]} & {dst_tensor[9, 9]}")
+
+# ---------------------------------------------------------------------------
+# Demonstrate dynamic header injection & recompilation via NVRTC
+# ---------------------------------------------------------------------------
+print("\nTesting NVRTC dynamic recompilation path (inject custom header)...")
+
+# Prepare a minimal header that adds an unused device helper.  In a real use
+# case this could define e.g. a GELU or ReLU transformation that will be used
+# by an element‑wise kernel variant compiled on‑the‑fly.
+header_code = b"__device__ float dummy_scale(float x) { return x * 1.0f; }\n"
+
+# Tell the allocator to use the new header for future kernel compilations.
+# The next sideaware_memcpy call will trigger recompilation automatically.
+header_id = alloc_lib.sideaware_set_custom_header(header_code)
+
+src_hdr = torch.arange(16, device="cuda", dtype=torch.float32).reshape(4, 4)
+dst_hdr = torch.zeros_like(src_hdr)
+
+torch.ops.sideaware.memcpy(dst_hdr, src_hdr)
+
+# Verify correctness after recompilation
+assert torch.all(dst_hdr == src_hdr)
+print("Header recompilation successful – memcpy still correct.")
 
 # Test with torch.compile
 @torch.compile(fullgraph=True)
