@@ -19,8 +19,8 @@
 // ---------------------------------------------------------------------------
 // Global configuration variables
 // ---------------------------------------------------------------------------
-static int g_num_devices = -1; // init on 1st call to getDeviceContext()
-static int g_preAllocExtraRequired = 1, g_preAllocExtraAlloc = 10; // configured by set_prealloc_config()
+static int g_num_devices = -1; // init on 1st call to get_device_context()
+static int g_prealloc_extra_required = 1, g_prealloc_extra_alloc = 10; // configured by set_prealloc_config()
 static size_t g_custom_alloc_threshold = 8ULL * 1024ULL * 1024ULL; // use custom allocator above this
 static size_t g_free_mapped_start_threshold = 16ULL * 1024ULL * 1024ULL * 1024ULL; // auto unmap on malloc above this
 static size_t g_free_mapped_end_threshold   = 2ULL  * 1024ULL * 1024ULL * 1024ULL; // stop auto unmapping at this point
@@ -50,15 +50,15 @@ constexpr int OFFSET_MIN_SM_PER_SIDE   = MAX_SM + 5;
 // Everything needed for side-aware page-based allocation
 // ---------------------------------------------------------------------------
 struct LargeAllocInfo {
-    size_t userRequested   = 0;
-    void*  basePtr         = nullptr;  // Points to the correctly aligned section for mapping
-    void*  allocPtr        = nullptr;  // Original pointer from cuMemAddressReserve
-    size_t alignedSize     = 0;
-    bool   useCompression  = false;
-    cudaStream_t lastUseStream = 0;
+    size_t user_requested   = 0;
+    void*  base_ptr         = nullptr;  // Points to the correctly aligned section for mapping
+    void*  alloc_ptr        = nullptr;  // Original pointer from cuMemAddressReserve
+    size_t aligned_size     = 0;
+    bool   use_compression  = false;
+    cudaStream_t last_use_stream = 0;
     std::vector<CUmemGenericAllocationHandle> handles; // One handle per 2MiB page
     // Track which side was actually used for each page so we know where to return it:
-    std::vector<int> sideUsed; // side (0 or 1) used for each page (returns to that pool on free)
+    std::vector<int> side_used; // side (0 or 1) used for each page (returns to that pool on free)
 };
 
 // ---------------------------------------------------------------------------
@@ -66,7 +66,7 @@ struct LargeAllocInfo {
 // ---------------------------------------------------------------------------
 typedef struct {
     unsigned char side_index[MAX_SM]; // struct to pass this as a single argument to the GPU
-} param_sm_side_t;
+} ParamSmSide;
 
 struct DeviceContext {
     // Device properties
@@ -76,7 +76,7 @@ struct DeviceContext {
 
     // CPU memory (used on CPU or passed as kernel parameter)
     int cpu_side_info[MAX_SM * 2];
-    param_sm_side_t param_sm_side;
+    ParamSmSide param_sm_side;
 
     // GPU memory for side info
     unsigned int* gpu_allocator_metadata = nullptr;
@@ -88,16 +88,16 @@ struct DeviceContext {
     unsigned char cpu_page_side[UNBACKED_VIRTUAL_PAGES];
 
     // Memory pools
-    std::vector<CUmemGenericAllocationHandle> freeHandlesSide0;
-    std::vector<CUmemGenericAllocationHandle> freeHandlesSide1;
-    std::unordered_map<size_t, std::vector<LargeAllocInfo>> largeAllocCache;
-    std::unordered_map<void*, LargeAllocInfo> largeAllocRegistry;
+    std::vector<CUmemGenericAllocationHandle> free_handles_side0;
+    std::vector<CUmemGenericAllocationHandle> free_handles_side1;
+    std::unordered_map<size_t, std::vector<LargeAllocInfo>> large_alloc_cache;
+    std::unordered_map<void*, LargeAllocInfo> large_alloc_registry;
 
     // State tracking
-    size_t totalMappedFree = 0;
-    bool crossSideWarningIssued = false;
-    bool compressionAvailable = false;
-    std::unordered_map<size_t, int> sizeSideMap;
+    size_t total_mapped_free = 0;
+    bool cross_side_warning_issued = false;
+    bool compression_available = false;
+    std::unordered_map<size_t, int> size_side_map;
 
     // Initialize the context for a specific device
     void initialize(cudaStream_t stream);
@@ -338,7 +338,7 @@ __global__ void test_page_latency(unsigned int* ptr, unsigned int *side_info, un
 // Device contexts array - indexed by device ID
 static std::vector<DeviceContext> g_deviceContexts;
 
-static DeviceContext& getDeviceContext(int device=-1) {
+static DeviceContext& get_device_context(int device=-1) {
     if (g_num_devices < 0) {
         cudaGetDeviceCount(&g_num_devices);
         g_deviceContexts.resize(g_num_devices);
@@ -413,7 +413,7 @@ static void init_allocation_constraints(DeviceContext& ctx)
 {
     int comp_available;
     cuDeviceGetAttribute(&comp_available, CU_DEVICE_ATTRIBUTE_GENERIC_COMPRESSION_SUPPORTED, ctx.device_id);
-    ctx.compressionAvailable = (comp_available != 0);
+    ctx.compression_available = (comp_available != 0);
 
     CUmemAllocationProp prop = {};
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -424,7 +424,7 @@ static void init_allocation_constraints(DeviceContext& ctx)
     CUresult res = cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
     assert(res == CUDA_SUCCESS && granularity == PAGE_SIZE); // Verify granularity equals PAGE_SIZE
 
-    if (ctx.compressionAvailable) {
+    if (ctx.compression_available) {
         prop.allocFlags.compressionType = CU_MEM_ALLOCATION_COMP_GENERIC;
         res = cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
         assert(res == CUDA_SUCCESS && granularity == PAGE_SIZE);
@@ -433,7 +433,7 @@ static void init_allocation_constraints(DeviceContext& ctx)
 
 static CUmemAllocationProp get_allocation_constraints(DeviceContext& ctx, bool use_compression=false)
 {
-    use_compression &= ctx.compressionAvailable;
+    use_compression &= ctx.compression_available;
 
     CUmemAllocationProp prop = {};
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -475,63 +475,63 @@ void DeviceContext::initialize(cudaStream_t stream) {
 // Unmap free blocks if threshold is exceeded
 // ---------------------------------------------------------------------------
 static void unmapFreeLargeAllocations(DeviceContext& ctx, size_t start_threshold=0, size_t end_threshold=0) {
-    if (ctx.totalMappedFree <= start_threshold) return;
+    if (ctx.total_mapped_free <= start_threshold) return;
 
     ScopedSetDevice guard(ctx.device_id);
     cudaDeviceSynchronize();
 
-    for (auto &kv : ctx.largeAllocCache) {
+    for (auto &kv : ctx.large_alloc_cache) {
         auto &vec = kv.second;
         auto it = vec.begin();
 
-        while (it != vec.end() && ctx.totalMappedFree > end_threshold) {
+        while (it != vec.end() && ctx.total_mapped_free > end_threshold) {
             LargeAllocInfo &blk = *it;
-            size_t size = blk.alignedSize;
-            size_t num_pages = blk.alignedSize / PAGE_SIZE;
-            CUdeviceptr base = (CUdeviceptr)blk.basePtr;
+            size_t size = blk.aligned_size;
+            size_t num_pages = blk.aligned_size / PAGE_SIZE;
+            CUdeviceptr base = (CUdeviceptr)blk.base_ptr;
 
             for (size_t i = 0; i < num_pages; i++) {
                 cuMemUnmap(base + i * PAGE_SIZE, PAGE_SIZE);
                 // Return handle to the side it was allocated from:
-                int side = blk.sideUsed[i];
+                int side = blk.side_used[i];
                 if (side == 0) {
-                    ctx.freeHandlesSide0.push_back(blk.handles[i]);
+                    ctx.free_handles_side0.push_back(blk.handles[i]);
                 } else {
-                    ctx.freeHandlesSide1.push_back(blk.handles[i]);
+                    ctx.free_handles_side1.push_back(blk.handles[i]);
                 }
             }
-            // Use allocPtr for freeing address space, not basePtr
-            cuMemAddressFree((CUdeviceptr)blk.allocPtr, blk.alignedSize + 2 * PAGE_SIZE);
+            // Use alloc_ptr for freeing address space, not base_ptr
+            cuMemAddressFree((CUdeviceptr)blk.alloc_ptr, blk.aligned_size + 2 * PAGE_SIZE);
 
-            assert(ctx.totalMappedFree >= size);
-            ctx.totalMappedFree -= size;
+            assert(ctx.total_mapped_free >= size);
+            ctx.total_mapped_free -= size;
             it = vec.erase(it);
         }
-        if (ctx.totalMappedFree <= end_threshold)
+        if (ctx.total_mapped_free <= end_threshold)
             break;
     }
     cudaDeviceSynchronize();
 }
 
 static size_t release_unused_memory_device(int device) {
-    DeviceContext& ctx = getDeviceContext(device);
+    DeviceContext& ctx = get_device_context(device);
     ScopedSetDevice guard(device);
 
     // Unmap all cached blocks then release handles from side0/side1 pools
     unmapFreeLargeAllocations(ctx);
 
     size_t freed_memory = 0;
-    for (auto &h : ctx.freeHandlesSide0) {
+    for (auto &h : ctx.free_handles_side0) {
         cuMemRelease(h);
         freed_memory += PAGE_SIZE;
     }
-    ctx.freeHandlesSide0.clear();
+    ctx.free_handles_side0.clear();
 
-    for (auto &h : ctx.freeHandlesSide1) {
+    for (auto &h : ctx.free_handles_side1) {
         cuMemRelease(h);
         freed_memory += PAGE_SIZE;
     }
-    ctx.freeHandlesSide1.clear();
+    ctx.free_handles_side1.clear();
 
     cudaDeviceSynchronize();
     return freed_memory;
@@ -622,9 +622,9 @@ static CUresult preAllocateHandles(DeviceContext& ctx, int countNeeded, bool use
             cuMemUnmap(dptr + i * PAGE_SIZE, PAGE_SIZE);
             int side = ctx.cpu_page_side[i];
             if (side == 0) {
-                ctx.freeHandlesSide0.push_back(tempHandles[i]);
+                ctx.free_handles_side0.push_back(tempHandles[i]);
             } else {
-                ctx.freeHandlesSide1.push_back(tempHandles[i]);
+                ctx.free_handles_side1.push_back(tempHandles[i]);
             }
         }
         cuMemAddressFree(dptr, batch * PAGE_SIZE);
@@ -646,16 +646,16 @@ static CUresult preAllocateHandles(DeviceContext& ctx, int countNeeded, bool use
 
 static CUresult ensureFreeHandlesAvailable(DeviceContext& ctx, size_t needed, bool useCompression, cudaStream_t stream)
 {
-    size_t needed_per_side = (needed + g_preAllocExtraRequired) / 2;
-    size_t free0 = ctx.freeHandlesSide0.size();
-    size_t free1 = ctx.freeHandlesSide1.size();
+    size_t needed_per_side = (needed + g_prealloc_extra_required) / 2;
+    size_t free0 = ctx.free_handles_side0.size();
+    size_t free1 = ctx.free_handles_side1.size();
     size_t needed_side0 = (needed_per_side > free0) ? (needed_per_side - free0) : 0;
     size_t needed_side1 = (needed_per_side > free1) ? (needed_per_side - free1) : 0;
     size_t needed_worst_case = max(needed_side0, needed_side1);
     size_t needed_both_sides = 2 * needed_worst_case;
 
     if (needed_both_sides > 0) {
-        needed_both_sides += g_preAllocExtraAlloc;
+        needed_both_sides += g_prealloc_extra_alloc;
         CUresult rc = preAllocateHandles(ctx, needed_both_sides, useCompression, stream);
         return rc;
     }
@@ -669,35 +669,35 @@ constexpr inline int pickSideFromVA(uint64_t va)
 
 static CUresult allocateCompressible(DeviceContext& ctx, LargeAllocInfo &info, size_t size, bool use_compression=false)
 {
-    info.alignedSize = ((size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
-    info.useCompression = (use_compression && ctx.compressionAvailable);
+    info.aligned_size = ((size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+    info.use_compression = (use_compression && ctx.compression_available);
 
     // 1) Pre-check we have enough free handles, otherwise allocate more:
-    size_t num_pages = info.alignedSize / PAGE_SIZE;
-    CUresult rc = ensureFreeHandlesAvailable(ctx, num_pages, info.useCompression, info.lastUseStream);
+    size_t num_pages = info.aligned_size / PAGE_SIZE;
+    CUresult rc = ensureFreeHandlesAvailable(ctx, num_pages, info.use_compression, info.last_use_stream);
     if (rc != CUDA_SUCCESS) {
         return rc;
     }
 
     // Determine the desired "start side" for this allocation size
     // If we haven't seen this size before, choose the side with fewer handles
-    if (ctx.sizeSideMap.find(info.alignedSize) == ctx.sizeSideMap.end()) {
-        int side0_free = ctx.freeHandlesSide0.size();
-        int side1_free = ctx.freeHandlesSide1.size();
-        ctx.sizeSideMap[info.alignedSize] = (side0_free >= side1_free) ? 0 : 1;
+    if (ctx.size_side_map.find(info.aligned_size) == ctx.size_side_map.end()) {
+        int side0_free = ctx.free_handles_side0.size();
+        int side1_free = ctx.free_handles_side1.size();
+        ctx.size_side_map[info.aligned_size] = (side0_free >= side1_free) ? 0 : 1;
     }
-    int desiredStartSide = ctx.sizeSideMap[info.alignedSize];
+    int desiredStartSide = ctx.size_side_map[info.aligned_size];
 
     // 2) Reserve VA space with EXTRA space (extra page = 2MiB)
     // This ensures we'll find a properly-aligned section with the desired side
     CUdeviceptr allocPtr = 0;
-    size_t extraSize = info.alignedSize + PAGE_SIZE;
+    size_t extraSize = info.aligned_size + PAGE_SIZE;
     rc = cuMemAddressReserve(&allocPtr, extraSize, 0, 0, 0);
     if (rc != CUDA_SUCCESS) {
         return rc;
     }
 
-    info.allocPtr = reinterpret_cast<void*>(allocPtr);
+    info.alloc_ptr = reinterpret_cast<void*>(allocPtr);
     CUdeviceptr basePtr = allocPtr;
 
     // If the first page is not on the desired side, try the second page
@@ -716,9 +716,9 @@ static CUresult allocateCompressible(DeviceContext& ctx, LargeAllocInfo &info, s
     }
 
     // Set the basePtr to point to the section with the desired side
-    info.basePtr = reinterpret_cast<void*>(basePtr);
+    info.base_ptr = reinterpret_cast<void*>(basePtr);
     info.handles.resize(num_pages);
-    info.sideUsed.resize(num_pages);
+    info.side_used.resize(num_pages);
 
     // 3) Map each page from whichever side is indicated by bit 21
     for (size_t i = 0; i < num_pages; i++) {
@@ -727,14 +727,14 @@ static CUresult allocateCompressible(DeviceContext& ctx, LargeAllocInfo &info, s
 
         // pop from the correct side if available
         std::vector<CUmemGenericAllocationHandle>* correctPool =
-            (desiredSide == 0) ? &ctx.freeHandlesSide0 : &ctx.freeHandlesSide1;
+            (desiredSide == 0) ? &ctx.free_handles_side0 : &ctx.free_handles_side1;
         std::vector<CUmemGenericAllocationHandle>* otherPool   =
-            (desiredSide == 0) ? &ctx.freeHandlesSide1 : &ctx.freeHandlesSide0;
+            (desiredSide == 0) ? &ctx.free_handles_side1 : &ctx.free_handles_side0;
 
         if (!correctPool->empty()) {
             info.handles[i] = correctPool->back();
             correctPool->pop_back();
-            info.sideUsed[i] = desiredSide;
+            info.side_used[i] = desiredSide;
         } else {
             // Try to fallback to the other side
             if (otherPool->empty()) {
@@ -743,30 +743,30 @@ static CUresult allocateCompressible(DeviceContext& ctx, LargeAllocInfo &info, s
                 return CUDA_ERROR_OUT_OF_MEMORY;
             }
             // Warn the first time this happens
-            if (!ctx.crossSideWarningIssued) {
+            if (!ctx.cross_side_warning_issued) {
                 printf("WARNING: Cross-side handle usage on device %d!\n", ctx.device_id);
-                ctx.crossSideWarningIssued = true;
+                ctx.cross_side_warning_issued = true;
             }
             info.handles[i] = otherPool->back();
             otherPool->pop_back();
-            info.sideUsed[i] = desiredSide;
+            info.side_used[i] = desiredSide;
         }
 
         rc = cuMemMap(basePtr + i * PAGE_SIZE, PAGE_SIZE, 0, info.handles[i], 0);
         if (rc != CUDA_SUCCESS) {
             // Return the handle to whichever side we took it from
-            if (info.sideUsed[i] == 0) {
-                ctx.freeHandlesSide0.push_back(info.handles[i]);
+            if (info.side_used[i] == 0) {
+                ctx.free_handles_side0.push_back(info.handles[i]);
             } else {
-                ctx.freeHandlesSide1.push_back(info.handles[i]);
+                ctx.free_handles_side1.push_back(info.handles[i]);
             }
             // Cleanup on allocation failure
             for (size_t j = 0; j < i; j++) {
                 cuMemUnmap(basePtr + j * PAGE_SIZE, PAGE_SIZE);
-                if (info.sideUsed[j] == 0) {
-                    ctx.freeHandlesSide0.push_back(info.handles[j]);
+                if (info.side_used[j] == 0) {
+                    ctx.free_handles_side0.push_back(info.handles[j]);
                 } else {
-                    ctx.freeHandlesSide1.push_back(info.handles[j]);
+                    ctx.free_handles_side1.push_back(info.handles[j]);
                 }
             }
             cuMemAddressFree(allocPtr, extraSize);
@@ -779,13 +779,13 @@ static CUresult allocateCompressible(DeviceContext& ctx, LargeAllocInfo &info, s
     accessDesc.location.id   = ctx.device_id;
     accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     accessDesc.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    rc = cuMemSetAccess(basePtr, info.alignedSize, &accessDesc, 1);
+    rc = cuMemSetAccess(basePtr, info.aligned_size, &accessDesc, 1);
     if (rc != CUDA_SUCCESS) {
         // Cleanup on allocation failure
         for (size_t i = 0; i < num_pages; i++) {
             cuMemUnmap(basePtr + i * PAGE_SIZE, PAGE_SIZE);
-            if (info.sideUsed[i] == 0) ctx.freeHandlesSide0.push_back(info.handles[i]);
-            else                       ctx.freeHandlesSide1.push_back(info.handles[i]);
+            if (info.side_used[i] == 0) ctx.free_handles_side0.push_back(info.handles[i]);
+            else                       ctx.free_handles_side1.push_back(info.handles[i]);
         }
         cuMemAddressFree(allocPtr, extraSize);
         return rc;
@@ -793,13 +793,13 @@ static CUresult allocateCompressible(DeviceContext& ctx, LargeAllocInfo &info, s
 
     // 5) Zero memory to be safe (TODO: make this configurable)
     cudaDeviceSynchronize();
-    rc = cuMemsetD8(basePtr, 0, info.alignedSize);
+    rc = cuMemsetD8(basePtr, 0, info.aligned_size);
     if (rc != CUDA_SUCCESS) {
         // Cleanup on allocation failure
         for (size_t i = 0; i < num_pages; i++) {
             cuMemUnmap(basePtr + i * PAGE_SIZE, PAGE_SIZE);
-            if (info.sideUsed[i] == 0) ctx.freeHandlesSide0.push_back(info.handles[i]);
-            else                       ctx.freeHandlesSide1.push_back(info.handles[i]);
+            if (info.side_used[i] == 0) ctx.free_handles_side0.push_back(info.handles[i]);
+            else                       ctx.free_handles_side1.push_back(info.handles[i]);
         }
         cuMemAddressFree(allocPtr, extraSize);
         return rc;
@@ -810,36 +810,36 @@ static CUresult allocateCompressible(DeviceContext& ctx, LargeAllocInfo &info, s
 
 static void* sideaware_reuse_alloc(DeviceContext& ctx, size_t alignedSize, cudaStream_t currentStream)
 {
-    auto &vec = ctx.largeAllocCache[alignedSize];
+    auto &vec = ctx.large_alloc_cache[alignedSize];
     if (vec.empty()) return nullptr;
 
     LargeAllocInfo info = vec.back();
-    assert(ctx.totalMappedFree >= info.alignedSize);
-    ctx.totalMappedFree -= info.alignedSize;
+    assert(ctx.total_mapped_free >= info.aligned_size);
+    ctx.total_mapped_free -= info.aligned_size;
     vec.pop_back();
 
     // If it's a different stream, we might need to synchronize
     // TODO: is this safe or do we need a full device synchronization?
-    if (info.lastUseStream != currentStream) {
-        cudaStreamSynchronize(info.lastUseStream);
-        info.lastUseStream = currentStream;
+    if (info.last_use_stream != currentStream) {
+        cudaStreamSynchronize(info.last_use_stream);
+        info.last_use_stream = currentStream;
     }
 
     // Insert back into active registry
-    ctx.largeAllocRegistry[info.basePtr] = info;
-    return info.basePtr;
+    ctx.large_alloc_registry[info.base_ptr] = info;
+    return info.base_ptr;
 }
 
 static void* sideaware_new_alloc(DeviceContext& ctx, size_t userSize, cudaStream_t stream)
 {
     LargeAllocInfo info;
-    info.userRequested = userSize;
-    info.lastUseStream = stream;
+    info.user_requested = userSize;
+    info.last_use_stream = stream;
     CUresult rc = allocateCompressible(ctx, info, userSize);
     if (rc != CUDA_SUCCESS)
         return nullptr;
-    ctx.largeAllocRegistry[info.basePtr] = info;
-    return info.basePtr;
+    ctx.large_alloc_registry[info.base_ptr] = info;
+    return info.base_ptr;
 }
 
 static void* sideaware_malloc_large(DeviceContext& ctx, size_t size, cudaStream_t stream)
@@ -863,8 +863,8 @@ static void* sideaware_malloc_large(DeviceContext& ctx, size_t size, cudaStream_
 static void sideaware_free_large(DeviceContext& ctx, void* ptr, cudaStream_t stream)
 {
     if (!ptr) return;
-    auto it = ctx.largeAllocRegistry.find(ptr);
-    if (it == ctx.largeAllocRegistry.end()) {
+    auto it = ctx.large_alloc_registry.find(ptr);
+    if (it == ctx.large_alloc_registry.end()) {
         if constexpr (TRY_CUDA_FREE_ON_MISS) {
             cudaFreeAsync(ptr, stream);
         } else {
@@ -875,9 +875,9 @@ static void sideaware_free_large(DeviceContext& ctx, void* ptr, cudaStream_t str
     }
 
     LargeAllocInfo info = it->second;
-    ctx.largeAllocRegistry.erase(it);
-    ctx.largeAllocCache[info.alignedSize].push_back(info);
-    ctx.totalMappedFree += info.alignedSize;
+    ctx.large_alloc_registry.erase(it);
+    ctx.large_alloc_cache[info.aligned_size].push_back(info);
+    ctx.total_mapped_free += info.aligned_size;
 }
 
 // ---------------------------------------------------------------------------
@@ -889,7 +889,7 @@ void* sideaware_malloc(size_t size, int device, cudaStream_t stream) {
     debugf("sideaware_malloc(%zu, %d, %p)\n", size, device, stream);
     void* p = nullptr;
     ScopedSetDevice guard(device);
-    DeviceContext& ctx = getDeviceContext(device);
+    DeviceContext& ctx = get_device_context(device);
 
     if (size >= g_custom_alloc_threshold) {
         p = sideaware_malloc_large(ctx, size, stream);
@@ -913,7 +913,7 @@ void sideaware_free(void* ptr, size_t size, int device, cudaStream_t stream) {
     debugf("sideaware_free(%p, %zu, %d, %p)\n", ptr, size, device, stream);
 
     if (!ptr) return;
-    DeviceContext& ctx = getDeviceContext(device);
+    DeviceContext& ctx = get_device_context(device);
     ScopedSetDevice guard(device);
 
     if (size >= g_custom_alloc_threshold) {
@@ -940,14 +940,14 @@ size_t sideaware_release_unused() {
 // ---------------------------------------------------------------------------
 void sideaware_elementwise(void* dst, const void* src, size_t size, int device, cudaStream_t stream, int header_id) {
     if (size == 0 || dst == nullptr || src == nullptr) return;
-    DeviceContext& ctx = getDeviceContext(device);
+    DeviceContext& ctx = get_device_context(device);
     assert(header_id >= 0 && header_id < ctx.kernel_cache.size());
 
     int sm_per_side = ctx.cpu_side_info[OFFSET_MIN_SM_PER_SIDE];
     int hash = ctx.cpu_side_info[OFFSET_SIDE_HASH_MASK] | (1 << 21);
 
     unsigned int size_32b = (unsigned int)size;
-    param_sm_side_t &param = ctx.param_sm_side;
+    ParamSmSide &param = ctx.param_sm_side;
     uint4* dst4 = (uint4*)dst;
     const uint4* src4 = (const uint4*)src;
 
@@ -979,7 +979,7 @@ void sideaware_memcpy(void* dst, const void* src, size_t size, int device, cudaS
 // NVRTC: allow user to inject custom header code for future elementwise ops
 // ---------------------------------------------------------------------------
 int sideaware_set_custom_header(const char* header) {
-    DeviceContext& ctx = getDeviceContext();
+    DeviceContext& ctx = get_device_context();
 
     if (!header || strlen(header)==0) {
         return 0; // default memcpy
@@ -1002,40 +1002,40 @@ int sideaware_set_custom_header(const char* header) {
 // Additional query/utility/config (mostly per device)
 // TODO: make it possible to get everything we need in a single function call
 // ---------------------------------------------------------------------------
-int get_num_sms() {
-    DeviceContext& ctx = getDeviceContext();
-    return ctx.num_sms;
-}
-
 void fill_sm_sides_tensor(unsigned char* gpu_tensor) {
-    DeviceContext& ctx = getDeviceContext();
+    DeviceContext& ctx = get_device_context();
     cudaError_t err = cudaMemcpy(gpu_tensor, ctx.gpu_side_index, ctx.num_sms, cudaMemcpyDeviceToDevice);
     assert(err == cudaSuccess);
 }
 
+int get_num_sms() {
+    DeviceContext& ctx = get_device_context();
+    return ctx.num_sms;
+}
+
 int get_num_sm_side0() {
-    DeviceContext& ctx = getDeviceContext();
+    DeviceContext& ctx = get_device_context();
     return ctx.cpu_side_info[OFFSET_NUM_SM_SIDE0];
 }
 
 int get_num_sm_side1() {
-    DeviceContext& ctx = getDeviceContext();
+    DeviceContext& ctx = get_device_context();
     return ctx.cpu_side_info[OFFSET_NUM_SM_SIDE1];
 }
 
 int get_min_sm_per_side() {
-    DeviceContext& ctx = getDeviceContext();
+    DeviceContext& ctx = get_device_context();
     return ctx.cpu_side_info[OFFSET_MIN_SM_PER_SIDE];
 }
 
 int get_hash_mask() {
-    DeviceContext& ctx = getDeviceContext();
+    DeviceContext& ctx = get_device_context();
     return ctx.cpu_side_info[OFFSET_SIDE_HASH_MASK];
 }
 
 void set_prealloc_config(int extra_required, int extra_alloc) {
-    g_preAllocExtraRequired = extra_required;
-    g_preAllocExtraAlloc = extra_alloc;
+    g_prealloc_extra_required = extra_required;
+    g_prealloc_extra_alloc = extra_alloc;
 }
 
 void set_custom_alloc_threshold(size_t threshold) {
