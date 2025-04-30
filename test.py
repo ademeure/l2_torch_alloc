@@ -14,15 +14,14 @@ torch.cuda.memory.change_current_allocator(new_alloc)
 alloc_lib = ctypes.CDLL('./alloc.so')
 
 # Define the function signatures for the new interface
-alloc_lib.get_num_sms.argtypes = []
-alloc_lib.get_num_sms.restype = ctypes.c_int
 alloc_lib.fill_sm_sides_tensor.argtypes = [ctypes.c_void_p]
 alloc_lib.fill_sm_sides_tensor.restype = ctypes.c_bool
 
-# Define all direct accessor functions with the same signature in one loop
-for func_name in ['get_num_sm_side0', 'get_num_sm_side1', 'get_min_sm_per_side', 'get_hash_mask']:
-    getattr(alloc_lib, func_name).argtypes = []
-    getattr(alloc_lib, func_name).restype = ctypes.c_int
+# Returns (num_sms, num_side0, num_side1, min_sm_per_side, hash_mask)
+alloc_lib.get_sm_side_summary_ptr.argtypes = []
+alloc_lib.get_sm_side_summary_ptr.restype = ctypes.POINTER(ctypes.c_int * 5)
+def get_sm_side_summary():
+    return tuple(alloc_lib.get_sm_side_summary_ptr().contents)
 
 # Setup sideaware_memcpy function (this is what gets called as torch.ops.sideaware.memcpy)
 # void sideaware_memcpy(void* dst, const void* src, size_t size, int device, cudaStream_t stream)
@@ -35,7 +34,6 @@ alloc_lib.sideaware_set_custom_header.argtypes = [ctypes.c_char_p]
 alloc_lib.sideaware_set_custom_header.restype = ctypes.c_int
 
 # elementwise (generic) API
-alloc_lib.sideaware_elementwise = alloc_lib.sideaware_elementwise
 alloc_lib.sideaware_elementwise.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
 alloc_lib.sideaware_elementwise.restype = None
 
@@ -44,7 +42,7 @@ def get_sm_side_index_tensor():
     # Need to allocate something first to trigger initialization
     dummy = torch.empty((1,), dtype=torch.uint8, device="cuda")
 
-    num_sms = alloc_lib.get_num_sms()
+    num_sms, _, _, _, _ = get_sm_side_summary()
     assert num_sms > 0
 
     sides_tensor = torch.zeros(num_sms, dtype=torch.uint8, device="cuda")
@@ -53,11 +51,13 @@ def get_sm_side_index_tensor():
     return sides_tensor
 
 def get_sm_sides_metadata():
+    num_sms, num_side0, num_side1, min_side, hash_mask = get_sm_side_summary()
     return {
-        "num_side0": alloc_lib.get_num_sm_side0(),
-        "num_side1": alloc_lib.get_num_sm_side1(),
-        "min_sm_per_side": alloc_lib.get_min_sm_per_side(),
-        "hash_mask": alloc_lib.get_hash_mask()
+        "num_sms": num_sms,
+        "num_side0": num_side0,
+        "num_side1": num_side1,
+        "min_sm_per_side": min_side,
+        "hash_mask": hash_mask,
     }
 
 # Define the PyTorch operator for manual memcpy

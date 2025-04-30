@@ -15,6 +15,11 @@
 #include <chrono>
 #include <fstream>
 #include <iterator>
+#include <cstdio>
+#include <cstdlib>
+#include <unistd.h>
+#include <string>
+#include <ctime>
 
 // ---------------------------------------------------------------------------
 // Global configuration variables
@@ -24,11 +29,13 @@ static int g_prealloc_extra_required = 1, g_prealloc_extra_alloc = 10; // config
 static size_t g_custom_alloc_threshold = 8ULL * 1024ULL * 1024ULL; // use custom allocator above this
 static size_t g_free_mapped_start_threshold = 16ULL * 1024ULL * 1024ULL * 1024ULL; // auto unmap on malloc above this
 static size_t g_free_mapped_end_threshold   = 2ULL  * 1024ULL * 1024ULL * 1024ULL; // stop auto unmapping at this point
+static std::string g_sass_filename; // If empty, don't output SASS. Set via set_output_sass().
 
 // ---------------------------------------------------------------------------
 // Compile Time Settings
 // ---------------------------------------------------------------------------
 //#define DEBUG_PRINTF
+constexpr bool   ALWAYS_OUTPUT_SASS = true;    // always output assembly to "sass" file (even if filename is empty)
 constexpr int    MAX_SM = 200;                 // enough for all NVIDIA GPUs up to GB300 (but not e.g. MI300X!)
 constexpr int    FORCED_HASH = 0;              // 0xB3000 for H100, 0xAB000 for GH200 96GiB, 0x1EF000 for GB200
 constexpr int    L2_SIDE_TEST_ITERATIONS = 25; // increases warmup time (at init & per page) but improves accuracy
@@ -190,23 +197,52 @@ static void compileFileToCUBIN(CUdevice device, char **cubin_out, const char *fi
 
     size_t cubin_size = 0;
     checkCudaErrors(nvrtcGetCUBINSize(program, &cubin_size));
+    if (cubin_size_out) *cubin_size_out = cubin_size;
+
     *cubin_out = static_cast<char*>(malloc(cubin_size));
     assert(*cubin_out && "Failed malloc for CUBIN");
 
     checkCudaErrors(nvrtcGetCUBIN(program, *cubin_out));
-    if (cubin_size_out) *cubin_size_out = cubin_size;
-
     checkCudaErrors(nvrtcDestroyProgram(&program));
+
+    // Extract SASS from the generated CUBIN and append it to the output file
+    if (ALWAYS_OUTPUT_SASS || !g_sass_filename.empty()) {
+        char tmpPath[] = "tmp_cubin";
+        FILE* tmpFile = fopen(tmpPath, "wb");
+        if (tmpFile) {
+            fwrite(*cubin_out, 1, cubin_size, tmpFile);
+            fclose(tmpFile);
+
+            std::string cmd = "cuobjdump --dump-sass " + std::string(tmpPath) + " 2>/dev/null";
+            if (FILE* pipe = popen(cmd.c_str(), "r")) {
+                std::ofstream sass_file(g_sass_filename.empty() ? "sass" : g_sass_filename, std::ios::app);
+                if (sass_file.is_open()) {
+                    char buffer[4096];
+                    auto now = std::chrono::system_clock::now();
+                    std::time_t now_c = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+                    std::strftime(buffer, sizeof(buffer), "%F %T", std::localtime(&now_c));
+
+                    sass_file << "==================== Start SASS dump (" << buffer << ") =====================\n";
+                    while (fgets(buffer, sizeof(buffer), pipe)) {
+                        sass_file << buffer;
+                    }
+                    sass_file << "===================== End SASS dump ======================\n";
+                }
+                pclose(pipe);
+            }
+        }
+        remove(tmpPath);
+    }
 }
 
-static CUmodule loadCUBIN(char *cubin, CUcontext context, CUdevice cuDevice) {
+static CUmodule loadCUBIN(char *cubin, CUdevice cuDevice, bool free_cubin=true) {
     CUmodule module;
     checkCudaErrors(cuModuleLoadData(&module, cubin));
-    free(cubin);
+    if (free_cubin) free(cubin);
     return module;
 }
 
-// Multi-GPU only: save current device and restore it when destroyed
+// Multi-GPU only: save current device and restore it when destroyed (out of scope)
 class ScopedSetDevice {
 public:
     explicit ScopedSetDevice(int new_device) {
@@ -371,7 +407,7 @@ static CUfunction getMemcpyKernel(DeviceContext &ctx, int header_id, bool aligne
     assert(header_id < ctx.kernel_cache.size() && header_id < ctx.header_strings.size());
     DeviceContext::KernelCacheEntry &entry = ctx.kernel_cache[header_id];
 
-    int idx = (aligned_2mib ? 0 : 2) + (use_64bit ? 1 : 0); // select variant
+    int idx = use_64bit ? 2 : (aligned_2mib ? 0 : 1); // select variant
     if (entry.funcs[idx] == nullptr) {
         // Compile module if not yet
         if (entry.module == nullptr) {
@@ -379,20 +415,17 @@ static CUfunction getMemcpyKernel(DeviceContext &ctx, int header_id, bool aligne
             cuCtxGetDevice(&cuDevice);
 
             char *cubin = nullptr;
-            const char* header_ptr = ctx.header_strings[header_id].empty() ? nullptr : ctx.header_strings[header_id].c_str();
+            const std::string& s = ctx.header_strings[header_id];
+            const char* header_ptr = s.empty() ? nullptr : s.c_str();
             compileFileToCUBIN(cuDevice, &cubin, "sideaware_kernels.cu", header_ptr);
-
-            CUcontext cuContext;
-            cuCtxGetCurrent(&cuContext);
-            entry.module = loadCUBIN(cubin, cuContext, cuDevice);
+            entry.module = loadCUBIN(cubin, cuDevice);
         }
 
-        const char* fn_names[4] = {
-            "side_aware_memcpy_aligned_32", "side_aware_memcpy_aligned_64",
-            "side_aware_memcpy_unaligned_32", "side_aware_memcpy_unaligned_64"
+        const char* fn_names[3] = {
+            "side_aware_memcpy_aligned_32", "side_aware_memcpy_unaligned_32", "side_aware_memcpy_unaligned_64"
         };
 
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 3; i++) {
             if (entry.funcs[i] == nullptr) {
                 CUfunction ftmp;
                 CUresult rc = cuModuleGetFunction(&ftmp, entry.module, fn_names[i]);
@@ -947,7 +980,6 @@ void sideaware_elementwise(void* dst, const void* src, size_t size, int device, 
     int hash = ctx.cpu_side_info[OFFSET_SIDE_HASH_MASK] | (1 << 21);
 
     unsigned int size_32b = (unsigned int)size;
-    ParamSmSide &param = ctx.param_sm_side;
     uint4* dst4 = (uint4*)dst;
     const uint4* src4 = (const uint4*)src;
 
@@ -955,9 +987,7 @@ void sideaware_elementwise(void* dst, const void* src, size_t size, int device, 
     bool use64 = (size >= 2ULL*1024*1024*1024);
 
     CUfunction kernel = getMemcpyKernel(ctx, header_id, aligned, use64);
-
-    int threadsPerBlock = 1024;
-    int blocks = ctx.num_sms;
+    CUstream cuStream = reinterpret_cast<CUstream>(stream);
 
     void* args[6];
     args[0] = &dst4;
@@ -965,10 +995,9 @@ void sideaware_elementwise(void* dst, const void* src, size_t size, int device, 
     args[2] = use64 ? (void*)&size : (void*)&size_32b;
     args[3] = &hash;
     args[4] = &sm_per_side;
-    args[5] = &param;
+    args[5] = &ctx.param_sm_side;
 
-    CUstream cuStream = reinterpret_cast<CUstream>(stream);
-    cuLaunchKernel(kernel, blocks, 1, 1, threadsPerBlock, 1, 1, 0, cuStream, args, nullptr);
+    cuLaunchKernel(kernel, ctx.num_sms, 1, 1, 256, 4, 1, 0, cuStream, args, nullptr);
 }
 
 void sideaware_memcpy(void* dst, const void* src, size_t size, int device, cudaStream_t stream) {
@@ -1000,13 +1029,47 @@ int sideaware_set_custom_header(const char* header) {
 
 // ---------------------------------------------------------------------------
 // Additional query/utility/config (mostly per device)
-// TODO: make it possible to get everything we need in a single function call
 // ---------------------------------------------------------------------------
 void fill_sm_sides_tensor(unsigned char* gpu_tensor) {
     DeviceContext& ctx = get_device_context();
     cudaError_t err = cudaMemcpy(gpu_tensor, ctx.gpu_side_index, ctx.num_sms, cudaMemcpyDeviceToDevice);
     assert(err == cudaSuccess);
 }
+
+const int* get_sm_side_summary_ptr()
+{
+    static int s[5];
+    DeviceContext& ctx = get_device_context();
+
+    s[0] = ctx.num_sms;
+    s[1] = ctx.cpu_side_info[OFFSET_NUM_SM_SIDE0];
+    s[2] = ctx.cpu_side_info[OFFSET_NUM_SM_SIDE1];
+    s[3] = ctx.cpu_side_info[OFFSET_MIN_SM_PER_SIDE];
+    s[4] = ctx.cpu_side_info[OFFSET_SIDE_HASH_MASK];
+    return s;
+}
+
+void set_custom_alloc_threshold(size_t threshold) {
+    g_custom_alloc_threshold = threshold;
+}
+
+void set_prealloc_config(int extra_required, int extra_alloc) {
+    g_prealloc_extra_required = extra_required;
+    g_prealloc_extra_alloc = extra_alloc;
+}
+
+void set_free_mapped_thresholds(size_t start_threshold, size_t end_threshold) {
+    g_free_mapped_start_threshold = start_threshold;
+    g_free_mapped_end_threshold = end_threshold;
+}
+
+void set_output_sass(const char* filename) {
+    g_sass_filename = (filename && filename[0]) ? filename : "";
+}
+
+// ---------------------------------------------------------------------------
+// Per-parameter query (rarely required)
+// ---------------------------------------------------------------------------
 
 int get_num_sms() {
     DeviceContext& ctx = get_device_context();
@@ -1031,20 +1094,6 @@ int get_min_sm_per_side() {
 int get_hash_mask() {
     DeviceContext& ctx = get_device_context();
     return ctx.cpu_side_info[OFFSET_SIDE_HASH_MASK];
-}
-
-void set_prealloc_config(int extra_required, int extra_alloc) {
-    g_prealloc_extra_required = extra_required;
-    g_prealloc_extra_alloc = extra_alloc;
-}
-
-void set_custom_alloc_threshold(size_t threshold) {
-    g_custom_alloc_threshold = threshold;
-}
-
-void set_free_mapped_thresholds(size_t start_threshold, size_t end_threshold) {
-    g_free_mapped_start_threshold = start_threshold;
-    g_free_mapped_end_threshold = end_threshold;
 }
 
 } // extern "C"
