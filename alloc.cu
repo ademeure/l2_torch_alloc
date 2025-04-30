@@ -247,17 +247,17 @@ class ScopedSetDevice {
 public:
     explicit ScopedSetDevice(int new_device) {
         if (g_num_devices != 1) {
-            cudaGetDevice(&old_);
+            cudaGetDevice(&old_device);
+            cudaSetDevice(new_device);
         }
-        cudaSetDevice(new_device);
     }
     ~ScopedSetDevice() {
         if (g_num_devices != 1) {
-            cudaSetDevice(old_);
+            cudaSetDevice(old_device);
         }
     }
 private:
-    int old_;
+    int old_device;
 };
 
 // ---------------------------------------------------------------------------
@@ -403,39 +403,33 @@ static DeviceContext& get_device_context(int device=-1) {
 
 // NVRTC kernel compilation helper (for side_aware_memcpy)
 // TODO: this isn't actually memcpy anymore
-static CUfunction getMemcpyKernel(DeviceContext &ctx, int header_id, bool aligned_2mib, bool use_64bit) {
+static CUfunction getMemcpyKernel(DeviceContext &ctx, int header_id, bool use_64bit) {
     assert(header_id < ctx.kernel_cache.size() && header_id < ctx.header_strings.size());
     DeviceContext::KernelCacheEntry &entry = ctx.kernel_cache[header_id];
 
-    int idx = use_64bit ? 2 : (aligned_2mib ? 0 : 1); // select variant
+    int idx = use_64bit ? 1 : 0; // select variant
     if (entry.funcs[idx] == nullptr) {
-        // Compile module if not yet
-        if (entry.module == nullptr) {
-            CUdevice cuDevice;
-            cuCtxGetDevice(&cuDevice);
+        assert(entry.module == nullptr);
 
-            char *cubin = nullptr;
-            const std::string& s = ctx.header_strings[header_id];
-            const char* header_ptr = s.empty() ? nullptr : s.c_str();
-            compileFileToCUBIN(cuDevice, &cubin, "sideaware_kernels.cu", header_ptr);
-            entry.module = loadCUBIN(cubin, cuDevice);
-        }
+        CUdevice cuDevice;
+        cuCtxGetDevice(&cuDevice);
 
-        const char* fn_names[3] = {
-            "side_aware_memcpy_aligned_32", "side_aware_memcpy_unaligned_32", "side_aware_memcpy_unaligned_64"
-        };
+        char *cubin = nullptr;
+        const std::string& s = ctx.header_strings[header_id];
+        const char* header_ptr = s.empty() ? nullptr : s.c_str();
+        compileFileToCUBIN(cuDevice, &cubin, "sideaware_kernels.cu", header_ptr);
+        entry.module = loadCUBIN(cubin, cuDevice);
 
-        for (int i = 0; i < 3; i++) {
-            if (entry.funcs[i] == nullptr) {
-                CUfunction ftmp;
-                CUresult rc = cuModuleGetFunction(&ftmp, entry.module, fn_names[i]);
-                if (rc != CUDA_SUCCESS) {
-                    const char *errStr = nullptr; cuGetErrorString(rc,&errStr);
-                    std::cerr << "Failed to get " << fn_names[i] << " : " << (errStr?errStr:"") << std::endl;
-                    std::abort();
-                }
-                entry.funcs[i] = ftmp;
+        const char* fn_names[2] = { "side_aware_memcpy_32", "side_aware_memcpy_64" };
+        for (int i = 0; i < 2; i++) {
+            CUfunction ftmp;
+            CUresult rc = cuModuleGetFunction(&ftmp, entry.module, fn_names[i]);
+            if (rc != CUDA_SUCCESS) {
+                const char *errStr = nullptr; cuGetErrorString(rc,&errStr);
+                std::cerr << "Failed to get " << fn_names[i] << " : " << (errStr?errStr:"") << std::endl;
+                std::abort();
             }
+            entry.funcs[i] = ftmp;
         }
     }
     return entry.funcs[idx];
@@ -983,10 +977,8 @@ void sideaware_elementwise(void* dst, const void* src, size_t size, int device, 
     uint4* dst4 = (uint4*)dst;
     const uint4* src4 = (const uint4*)src;
 
-    bool aligned = ((intptr_t)src % (2UL*1024*1024) == 0);
     bool use64 = (size >= 2ULL*1024*1024*1024);
-
-    CUfunction kernel = getMemcpyKernel(ctx, header_id, aligned, use64);
+    CUfunction kernel = getMemcpyKernel(ctx, header_id, use64);
     CUstream cuStream = reinterpret_cast<CUstream>(stream);
 
     void* args[6];

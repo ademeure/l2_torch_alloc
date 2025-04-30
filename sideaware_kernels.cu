@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------------
 #include <cuda_runtime.h>
 
+constexpr int FORCED_UNROLL = 4; // TODO: make easy to configure
 constexpr bool FORCE_WRONG_SIDE = false;
 constexpr bool FORCE_RANDOM_SIDE = false;
 constexpr unsigned int CHUNK_SIZE = 4096;
@@ -20,15 +21,13 @@ struct unused {}; // type for inputs/outputs not used in the kernel
 // ----------------------------------------------------------------------------
 // L2 Side Aware memcpy kernel (single input, single output, any byte count)
 // ----------------------------------------------------------------------------
-template<bool aligned_2mib = false, int FORCED_UNROLL = 4, typename size_type = size_t>
+template<typename size_type = size_t>
 __device__ __forceinline__ void side_aware_memcpy_device(
         uint4 * __restrict__ output,
         const uint4 * __restrict__ input,
-        size_type num_bytes,
-        unsigned int hash,
-        unsigned int num_sm_per_side,
+        size_type num_bytes, unsigned int hash, unsigned int num_sm_per_side,
         const param_sm_side_t params) {
-
+    // ...
     unsigned int smid;
     asm volatile("mov.u32 %0, %smid;\n" : "=r"(smid) :);
 
@@ -54,18 +53,13 @@ __device__ __forceinline__ void side_aware_memcpy_device(
     unsigned int offset_per_i_iter = (offset_per_i * num_groups_per_side) - offset_per_i;
     size_type byte_offset = global_idx * offset_per_i + group_tid_offset;
 
-    if constexpr (aligned_2mib) {
-        // needed because start address might not be 4MiB aligned but our custom hash uses bit 21
-        sm_side ^= __popc(base & hash) & 1;
-    }
-
 #pragma unroll
     for (unsigned int i = global_idx; i < multi_chunks; i += num_groups_per_side, byte_offset += offset_per_i_iter) {
         size_type offsets[FORCED_UNROLL];
         uint4 inputs[FORCED_UNROLL];
 #pragma unroll FORCED_UNROLL
         for (int j = 0; j < FORCED_UNROLL; j++, byte_offset += offset_per_j) {
-            unsigned int lsb_bits = (aligned_2mib ? 0 : base) + (byte_offset & 0xFFFFFFFF);
+            unsigned int lsb_bits = base + (byte_offset & 0xFFFFFFFF);
             unsigned int side = __popc(lsb_bits & hash) & 1;
             if constexpr (FORCE_WRONG_SIDE) side ^= 1;
             if constexpr (FORCE_RANDOM_SIDE) side = 0;
@@ -89,7 +83,7 @@ __device__ __forceinline__ void side_aware_memcpy_device(
         int idx = sm_side_index - start_sm_side_idx;
         if (idx >= 0) {
             size_type byte_offset = (size_type)(idx + multi_chunks*FORCED_UNROLL) * (2*CHUNK_SIZE) + group_tid_offset;
-            unsigned int lsb_bits = (aligned_2mib ? 0 : base) + (byte_offset & 0xFFFFFFFF);
+            unsigned int lsb_bits = base + (byte_offset & 0xFFFFFFFF);
             unsigned int side = __popc(lsb_bits & hash) & 1;
 
             unsigned int use_second_chunk = sm_side ^ side;
@@ -123,19 +117,16 @@ __device__ __forceinline__ void elementwise_op(
     output1 = input1;
 }
 
-template<bool aligned_2mib = false, int FORCED_UNROLL = 4, typename size_type = size_t,
-        bool sideaware_output = false,
+template<typename size_type = size_t, bool sideaware_output = false,
         typename o0 = uint4, typename o1 = uint4,
         typename i0 = uint4, typename i1 = uint4, typename i2 = uint4, typename i3 = uint4>
 __device__ __forceinline__ void side_aware_elementwise_device(
         o0* __restrict__ output0, o1* __restrict__ output1,
         const i0 * __restrict__ input0, const i1 * __restrict__ input1,
         const i2 * __restrict__ input2, const i3 * __restrict__ input3,
-        size_type num_elements,
-        unsigned int hash,
-        unsigned int num_sm_per_side,
+        size_type num_elements, unsigned int hash, unsigned int num_sm_per_side,
         const param_sm_side_t params) {
-
+    // ...
     unsigned int smid;
     asm volatile("mov.u32 %0, %smid;\n" : "=r"(smid) :);
 
@@ -165,11 +156,6 @@ __device__ __forceinline__ void side_aware_elementwise_device(
     unsigned int offset_per_i_iter = (offset_per_i * num_groups_per_side) - offset_per_i;
     size_type byte_offset = global_idx * offset_per_i + group_tid_offset;
 
-    if constexpr (aligned_2mib) {
-        // needed because start address might not be 4MiB aligned but our custom hash uses bit 21
-        sm_side ^= __popc(base & (1 << 21)) & 1;
-    }
-
 #pragma unroll
     for (unsigned int i = global_idx; i < multi_chunks; i += num_groups_per_side, byte_offset += offset_per_i_iter) {
         size_type elements[FORCED_UNROLL];
@@ -179,7 +165,7 @@ __device__ __forceinline__ void side_aware_elementwise_device(
         i3 inputs3[FORCED_UNROLL];
 #pragma unroll FORCED_UNROLL
         for (int j = 0; j < FORCED_UNROLL; j++, byte_offset += offset_per_j) {
-            unsigned int lsb_bits = (aligned_2mib ? 0 : base) + (byte_offset & 0xFFFFFFFF);
+            unsigned int lsb_bits = base + (byte_offset & 0xFFFFFFFF);
 
             unsigned int side = __popc(lsb_bits & hash) & 1;
             if constexpr (FORCE_WRONG_SIDE) side ^= 1;
@@ -209,7 +195,7 @@ __device__ __forceinline__ void side_aware_elementwise_device(
         int idx = sm_side_index - start_sm_side_idx;
         if (idx >= 0) {
             size_type byte_offset = (size_type)(idx + multi_chunks*FORCED_UNROLL) * (2*CHUNK_SIZE) + group_tid_offset;
-            unsigned int lsb_bits = (aligned_2mib ? 0 : base) + (byte_offset & 0xFFFFFFFF);
+            unsigned int lsb_bits = base + (byte_offset & 0xFFFFFFFF);
             unsigned int side = __popc(lsb_bits & hash) & 1;
 
             unsigned int use_second_chunk = sm_side ^ side;
@@ -230,36 +216,29 @@ __device__ __forceinline__ void side_aware_elementwise_device(
 
 extern "C" {
 /*
-__global__ void side_aware_elementwise_aligned_32(
+__global__ void side_aware_elementwise_32(
         uint4* __restrict__ dst, const uint4* __restrict__ src,
         unsigned int num_bytes, unsigned int hash, unsigned int sm_per_side,
         __grid_constant__ const param_sm_side_t params) {
 
     size_t num_elements = num_bytes / sizeof(uint4);
-    side_aware_elementwise_device<true, 4, unsigned int, false, uint4, unused, uint4, unused, unused, unused>(
+    side_aware_elementwise_device<unsigned int, false, uint4, unused, uint4, unused, unused, unused>(
         dst, nullptr, src, nullptr, nullptr, nullptr, num_elements, hash, sm_per_side, params);
 }
 */
 
-__global__ __launch_bounds__(1024, 1) void side_aware_memcpy_aligned_32(
+__global__ __launch_bounds__(1024, 1) void side_aware_memcpy_32(
         uint4* __restrict__ dst, const uint4* __restrict__ src,
         unsigned int num_bytes, unsigned int hash, unsigned int sm_per_side,
         __grid_constant__ const param_sm_side_t params) {
-    side_aware_memcpy_device<true, 4, unsigned int>(dst, src, num_bytes, hash, sm_per_side, params);
+    side_aware_memcpy_device<unsigned int>(dst, src, num_bytes, hash, sm_per_side, params);
 }
 
-__global__ __launch_bounds__(1024, 1) void side_aware_memcpy_unaligned_32(
-        uint4* __restrict__ dst, const uint4* __restrict__ src,
-        unsigned int num_bytes, unsigned int hash, unsigned int sm_per_side,
-        __grid_constant__ const param_sm_side_t params) {
-    side_aware_memcpy_device<false, 4, unsigned int>(dst, src, num_bytes, hash, sm_per_side, params);
-}
-
-__global__ __launch_bounds__(1024, 1) void side_aware_memcpy_unaligned_64(
+__global__ __launch_bounds__(1024, 1) void side_aware_memcpy_64(
         uint4* __restrict__ dst, const uint4* __restrict__ src,
         size_t num_bytes, unsigned int hash, unsigned int sm_per_side,
         __grid_constant__ const param_sm_side_t params) {
-    side_aware_memcpy_device<false, 4, size_t>(dst, src, num_bytes, hash, sm_per_side, params);
+    side_aware_memcpy_device<size_t>(dst, src, num_bytes, hash, sm_per_side, params);
 }
 
 } // extern "C"
