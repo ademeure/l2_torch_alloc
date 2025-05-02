@@ -75,6 +75,10 @@ def sideaware_memcpy(dst: torch.Tensor, src: torch.Tensor) -> None:
     assert dst.dtype == src.dtype, "Source and destination must have the same dtype"
     assert dst.numel() >= src.numel(), "Destination tensor must be at least as large as source"
 
+    # Make sure src and dst are contiguous
+    assert src.is_contiguous(), "Source tensor must be contiguous"
+    assert dst.is_contiguous(), "Destination tensor must be contiguous"
+
     # Get pointers and size
     dst_ptr = dst.data_ptr()
     src_ptr = src.data_ptr()
@@ -183,7 +187,7 @@ for factor in (1024, 1024 ** 2):
 # Comprehensive testing for sideaware_memcpy
 print("\n===== COMPREHENSIVE MANUAL MEMCPY TESTING =====")
 
-def test_memcpy_correctness(shape, dtype=torch.float32, run_benchmark=False):
+def test_memcpy_correctness(shape, dtype=torch.float32, run_benchmark=False, start_idx=0):
     """Test correctness of sideaware_memcpy with tensors of given shape and dtype."""
     print(f"\nTesting shape={shape}, dtype={dtype}")
 
@@ -209,7 +213,7 @@ def test_memcpy_correctness(shape, dtype=torch.float32, run_benchmark=False):
             end = torch.cuda.Event(enable_timing=True)
 
             start.record()
-            torch.ops.sideaware.memcpy(dst_manual, src)
+            torch.ops.sideaware.memcpy(dst_manual[start_idx:], src[start_idx:])
             end.record()
             torch.cuda.synchronize()
             manual_time = start.elapsed_time(end)
@@ -217,7 +221,7 @@ def test_memcpy_correctness(shape, dtype=torch.float32, run_benchmark=False):
 
             # Copy using PyTorch's built-in
             start.record()
-            dst_builtin.copy_(src)
+            dst_builtin[start_idx:].copy_(src[start_idx:])
             end.record()
             torch.cuda.synchronize()
             builtin_time = start.elapsed_time(end)
@@ -225,25 +229,27 @@ def test_memcpy_correctness(shape, dtype=torch.float32, run_benchmark=False):
             print(f"\tRatio (manual/builtin): {manual_time/builtin_time:.2f}x")
     else:
         # Just do the copies without timing
-        torch.ops.sideaware.memcpy(dst_manual, src)
-        dst_builtin.copy_(src)
+        torch.ops.sideaware.memcpy(dst_manual[start_idx:], src[start_idx:])
+        dst_builtin[start_idx:].copy_(src[start_idx:])
 
     # Check correctness
     is_equal = torch.all(dst_manual == dst_builtin).item()
     print(f"Tensors equal: {is_equal}")
 
     if not is_equal:
-        # Show where differences occur
+        # Show up to 5 differences
         diff_indices = (dst_manual != dst_builtin).nonzero()
-        sample_idx = diff_indices[0].tolist()
-        print(f"First difference at index {sample_idx}")
-        print(f"!!! Manual value: {dst_manual[tuple(sample_idx)]}")
-        print(f"!!! Built-in value: {dst_builtin[tuple(sample_idx)]}")
+        next_diffs = diff_indices[0:5]
+        for idx in next_diffs:
+            print(f"--- Index: {idx}")
+            print(f"!!! Output: {dst_manual[tuple(idx)]}")
+            print(f"!!! Expected: {dst_builtin[tuple(idx)]}")
+
 
     return is_equal
 
 # Test with increasing sizes
-test_memcpy_correctness((2, 7777))  # Small: <64KiB (not multiple of 16 bytes!)
+test_memcpy_correctness((2, 7777), start_idx=1)  # Small: <64KiB (not multiple of 16 bytes!)
 test_memcpy_correctness((100000, 15000))  # Huge: 6 GB
 
 # Test different dtypes

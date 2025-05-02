@@ -973,21 +973,37 @@ void sideaware_elementwise(void* dst, const void* src, size_t size, int device, 
     int sm_per_side = ctx.cpu_side_info[OFFSET_MIN_SM_PER_SIDE];
     int hash = ctx.cpu_side_info[OFFSET_SIDE_HASH_MASK] | (1 << 21);
 
-    unsigned int size_32b = (unsigned int)size;
+    unsigned int byte_start = (unsigned long long)src & 15;
+    unsigned int byte_end = ((unsigned long long)src + size) & 15;
+    size_t size_aligned = size;
+
+    if (byte_start) {
+        src = (const uint4*)(((const unsigned char*)src) + sizeof(uint4) - byte_start);
+        dst = (uint4*)(((unsigned char*)dst) + sizeof(uint4) - byte_start);
+        size_aligned -= (sizeof(uint4) - byte_start);
+    }
+    if (byte_end) {
+        size_aligned -= byte_end;
+    }
+
+    unsigned int size_aligned_32b = (unsigned int)size_aligned;
     uint4* dst4 = (uint4*)dst;
     const uint4* src4 = (const uint4*)src;
 
-    bool use64 = (size >= 2ULL*1024*1024*1024);
+
+    bool use64 = (size >= 2ULL*1024*1024*1024) || byte_start || byte_end;
     CUfunction kernel = getMemcpyKernel(ctx, header_id, use64);
     CUstream cuStream = reinterpret_cast<CUstream>(stream);
 
-    void* args[6];
+    void* args[8];
     args[0] = &dst4;
     args[1] = &src4;
-    args[2] = use64 ? (void*)&size : (void*)&size_32b;
-    args[3] = &hash;
-    args[4] = &sm_per_side;
-    args[5] = &ctx.param_sm_side;
+    args[2] = use64 ? (void*)&size_aligned : (void*)&size_aligned_32b;
+    args[3] = &byte_start;
+    args[4] = &byte_end;
+    args[5] = &hash;
+    args[6] = &sm_per_side;
+    args[7] = &ctx.param_sm_side;
 
     cuLaunchKernel(kernel, ctx.num_sms, 1, 1, 256, 4, 1, 0, cuStream, args, nullptr);
 }
