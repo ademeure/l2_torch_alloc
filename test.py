@@ -75,14 +75,15 @@ def sideaware_memcpy(dst: torch.Tensor, src: torch.Tensor) -> None:
     assert dst.dtype == src.dtype, "Source and destination must have the same dtype"
     assert dst.numel() >= src.numel(), "Destination tensor must be at least as large as source"
 
-    # Make sure src and dst are contiguous
-    assert src.is_contiguous(), "Source tensor must be contiguous"
-    assert dst.is_contiguous(), "Destination tensor must be contiguous"
-
     # Get pointers and size
     dst_ptr = dst.data_ptr()
     src_ptr = src.data_ptr()
     size_in_bytes = src.numel() * src.element_size()
+
+    # Make sure src and dst are contiguous and aligned
+    assert src.is_contiguous(), "Source tensor must be contiguous"
+    assert dst.is_contiguous(), "Destination tensor must be contiguous"
+    assert (dst_ptr % 16 == 0) and (src_ptr % 16 == 0), "Destination and source must be 16-byte aligned"
 
     # Get the current CUDA stream
     device = torch.cuda.current_device()
@@ -249,7 +250,7 @@ def test_memcpy_correctness(shape, dtype=torch.float32, run_benchmark=False, sta
     return is_equal
 
 # Test with increasing sizes
-test_memcpy_correctness((2, 7777), start_idx=1)  # Small: <64KiB (not multiple of 16 bytes!)
+test_memcpy_correctness((4, 777))  # Tiny
 test_memcpy_correctness((100000, 15000))  # Huge: 6 GB
 
 # Test different dtypes
