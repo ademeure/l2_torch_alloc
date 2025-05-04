@@ -1,26 +1,11 @@
-struct unused {};
-typedef int o0, i0;
-typedef unused o1, o2, o3, i1, i2, i3;
-
-__device__ void elementwise_op(size_t element_idx,
-                               o0 &out0, o1 &out1,
-                               o2 &out2, o3 &out3,
-                               const i0 &in0, const i1 &in1,
-                               const i2 &in2, const i3 &in3) {
-    out0 = in0;
-}
-
-constexpr int unrolled = 4; // unrolled loop iterations (increases register pressure especially with multiple inputs)
-constexpr bool reverse_order = true; // process end of array 1st (maximise L2 hits with normal->reverse->normal->...)
-constexpr bool input_evict[4] = {true, true, true, true}; // do not keep inputs in L2 (more space for outputs)
-
-constexpr bool support_concurrent_kernels = false; // use atomics to dynamically assign SM side index
-constexpr bool input_discard[4] = {0}; // danger: discards from L2 *before* data is written to DRAM
-
 // ----------------------------------------------------------------------------
 // L2 Side Aware Multi-Input / Multi-Output Elementwise kernel (16B alignment)
 // ----------------------------------------------------------------------------
 #include <cuda_runtime.h>
+
+#ifndef KERNEL_NAME
+#define KERNEL_NAME side_aware_elementwise
+#endif
 
 #ifndef CUSTOM_VECTOR_OP
 template<typename size_type>
@@ -40,7 +25,6 @@ __device__ void vector_op(size_type idx, int vec_size,
 
 #ifndef FORCE_WRONG_SIDE
 #define FORCE_WRONG_SIDE false
-#endif
 
 #ifndef FORCE_RANDOM_SIDE
 #define FORCE_RANDOM_SIDE false
@@ -110,7 +94,7 @@ typedef struct {
     unsigned char side_index[MAX_SM];
 } param_sm_side_t;
 
-extern "C" __global__ LAUNCH_BOUNDS void side_aware_elementwise(
+extern "C" __global__ LAUNCH_BOUNDS void KERNEL_NAME(
         size_type num_vectors_16B,
         vo0* __restrict__ output0, vo1* __restrict__ output1,
         vo2* __restrict__ output2, vo3* __restrict__ output3,
