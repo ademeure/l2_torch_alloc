@@ -1,9 +1,18 @@
-// ---------------------------------------------------------------------------
-// TODO: Documentation...
-// ---------------------------------------------------------------------------
-// Example build & test command:
-// nvcc -arch=native -Xcompiler -fPIC -shared sideaware.cu -o sideaware.so -lcuda -lnvrtc && python test.py
-// ---------------------------------------------------------------------------
+// ============================================================================
+// "L2 Side Aware" memory allocation & elementwise kernels in a single CUDA file
+// ============================================================================
+// - World's most efficient Hopper & Blackwell memcpy and elementwise kernels (>10% lower power)
+// - PyTorch Pluggable Allocator support (+easy interface for any CUDA project)
+// - Easy custom kernels with NVRTC recompilation
+// - Up to 4 inputs and 4 outputs of any size
+// - L2 hints, discard, compression, etc...
+// ============================================================================
+// Example build & test commands:
+//   nvcc -arch=native -Xcompiler -fPIC -shared sideaware.cu -o sideaware.so -lcuda -lnvrtc && python test.py
+// ============================================================================
+// Also see sideaware_alloc.cu & sideaware_memcpy.cu (subset without PyTorch/NVRTC/etc.)
+// https://github.com/ademeure/l2_torch_alloc
+// ============================================================================
 #include <cassert>
 #include <cstring>
 #include <iostream>
@@ -44,9 +53,11 @@ constexpr bool input_discard[4] = {0}; // danger: discards from L2 *before* data
 )SIDEAWARE_MEMCPY";
 
 static const char* SIDEAWARE_KERNEL_SOURCE = R"SIDEAWARE_KERNEL(
-// ----------------------------------------------------------------------------
-// L2 Side Aware Multi-Input / Multi-Output Elementwise kernel (16B alignment)
-// ----------------------------------------------------------------------------
+// ============================================================================
+// L2 Side Aware Multi-Input / Multi-Output Elementwise kernel
+// 16B alignment is required (even when it works, it's slower, so why bother?)
+// Most efficient with 2MiB aligned addresses and array sizes of less than 2GiB
+// ============================================================================
 #include <cuda_runtime.h>
 
 #define KERNEL_NAME sideaware_elementwise

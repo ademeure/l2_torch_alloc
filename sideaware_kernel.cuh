@@ -1,6 +1,8 @@
-// ----------------------------------------------------------------------------
-// L2 Side Aware Multi-Input / Multi-Output Elementwise kernel (16B alignment)
-// ----------------------------------------------------------------------------
+// ============================================================================
+// L2 Side Aware Multi-Input / Multi-Output Elementwise kernel
+// 16B alignment is required (even when it works, it's slower, so why bother?)
+// Most efficient with 2MiB aligned addresses and array sizes of less than 2GiB
+// ============================================================================
 #include <cuda_runtime.h>
 
 #ifndef KERNEL_NAME

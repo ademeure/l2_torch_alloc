@@ -1,8 +1,9 @@
-// ---------------------------------------------------------------------------
+// ============================================================================
 // Subset of sideaware.cu memory allocation for a single device
 // This is all you need to integrate for your custom CUDA project (non-PyTorch)
 // For kernels, look at sideaware_memcpy.cu which includes sideaware_kernel.cuh
-// ---------------------------------------------------------------------------
+// https://github.com/ademeure/l2_torch_alloc
+// ============================================================================
 #include <cassert>
 #include <cstring>
 #include <iostream>
