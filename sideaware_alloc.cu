@@ -457,33 +457,25 @@ static CUresult sideaware_preallocate(DeviceContext& ctx, int countNeeded, bool 
     return lastError;
 }
 
-static CUresult sideaware_allocate_threshold(DeviceContext& ctx, size_t needed, bool compression, cudaStream_t stream)
-{
-    size_t needed_per_side = (needed + g_prealloc_extra_required) / 2;
-    size_t free0 = ctx.free_handles_side[0].size();
-    size_t free1 = ctx.free_handles_side[1].size();
-    size_t needed_side0 = (needed_per_side > free0) ? (needed_per_side - free0) : 0;
-    size_t needed_side1 = (needed_per_side > free1) ? (needed_per_side - free1) : 0;
-    size_t needed_worst_case = max(needed_side0, needed_side1);
-    size_t needed_both_sides = 2 * needed_worst_case;
-
-    if (needed_both_sides > 0) {
-        needed_both_sides += g_prealloc_extra_alloc;
-        CUresult rc = sideaware_preallocate(ctx, needed_both_sides, compression, stream);
-        return rc;
-    }
-    return CUDA_SUCCESS;
-}
-
 constexpr inline int side_from_virtual_address(uint64_t va)
 {
     return (int)((va >> SIDE_HASH_BIT) & 1ULL);
 }
 
-static CUresult sideaware_allocate(DeviceContext& ctx, LargeAllocInfo &info, size_t size, bool compression=false)
+// ---------------------------------------------------------------------------
+// KEY FUNCTION: Allocate by mapping preallocated physical memory (which we already know the side of)
+// We want bit 21 of the virtual address to fully determine the base side of that 2MiB page
+// So we try to map a free physical page from the correct side's pool if any is available
+// Also we try to have every allocation of the same size have the same 4MiB alignment
+// (so if you do a memcpy between two buffers of the same size, read & write sides will match)
+// ---------------------------------------------------------------------------
+static CUresult sideaware_allocate(DeviceContext& ctx, LargeAllocInfo &info, size_t size, bool compression)
 {
     info.aligned_size = ((size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
     info.use_compression = (compression && ctx.compression_available);
+
+    size_t num_pages = info.aligned_size / PAGE_SIZE;
+    CUresult rc = CUDA_SUCCESS;
 
     // Optional sync to make sure we catch all async errors before allocation
     if constexpr (SYNC_ON_EVERY_ALLOC) {
@@ -494,10 +486,21 @@ static CUresult sideaware_allocate(DeviceContext& ctx, LargeAllocInfo &info, siz
     }
 
     // 1) Pre-check we have enough free handles, otherwise allocate more
-    size_t num_pages = info.aligned_size / PAGE_SIZE;
-    CUresult rc = sideaware_allocate_threshold(ctx, num_pages, info.use_compression, info.last_use_stream);
-    if (rc != CUDA_SUCCESS) {
-        return rc;
+    // This heuristic is a bit complicated and could probably be improved
+    size_t needed_per_side = (num_pages + g_prealloc_extra_required) / 2;
+    size_t free0 = ctx.free_handles_side[0].size();
+    size_t free1 = ctx.free_handles_side[1].size();
+    size_t needed_side0 = (needed_per_side > free0) ? (needed_per_side - free0) : 0;
+    size_t needed_side1 = (needed_per_side > free1) ? (needed_per_side - free1) : 0;
+    size_t needed_worst_case = max(needed_side0, needed_side1);
+    size_t needed_both_sides = 2 * needed_worst_case;
+
+    if (needed_both_sides > 0) {
+        needed_both_sides += g_prealloc_extra_alloc;
+        rc = sideaware_preallocate(ctx, needed_both_sides, compression, info.last_use_stream);
+        if (rc != CUDA_SUCCESS) {
+            return rc;
+        }
     }
 
     // Determine the desired "start side" for this allocation size
