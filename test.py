@@ -22,7 +22,7 @@ lib.sideaware_compile.restype = ctypes.c_int
 # Sideaware single-input / single-output elementwise API (simple version)
 lib.sideaware_one_to_one.argtypes = [ctypes.c_int, ctypes.c_size_t, # kernel_id, num_bytes
                                            ctypes.c_void_p, ctypes.c_void_p, # out0, in0
-                                           ctypes.c_void_p] # stream
+                                           ctypes.c_int, ctypes.c_void_p] # device, stream
 lib.sideaware_one_to_one.restype = None
 
 # Sideaware multi-input / multi-output elementwise API (advanced version)

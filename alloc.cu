@@ -2,7 +2,7 @@
 // TODO: Documentation...
 // ---------------------------------------------------------------------------
 // Example build & test command:
-// nvcc --gpu-architecture=native -Xcompiler -fPIC -shared sideaware.cu -o sideaware.so -lcuda -lnvrtc && python test.py
+// nvcc -arch=native -Xcompiler -fPIC -shared sideaware.cu -o sideaware.so -lcuda -lnvrtc && python test.py
 // ---------------------------------------------------------------------------
 #include <cassert>
 #include <cstring>
@@ -14,10 +14,8 @@
 #include <nvrtc.h>
 #include <chrono>
 #include <fstream>
-#include <iterator>
 #include <cstdio>
 #include <cstdlib>
-#include <unistd.h>
 #include <string>
 #include <ctime>
 
@@ -50,6 +48,10 @@ static const char* SIDEAWARE_KERNEL_SOURCE = R"SIDEAWARE_KERNEL(
 // L2 Side Aware Multi-Input / Multi-Output Elementwise kernel (16B alignment)
 // ----------------------------------------------------------------------------
 #include <cuda_runtime.h>
+
+#ifndef KERNEL_NAME
+#define KERNEL_NAME sideaware_elementwise
+#endif
 
 #ifndef CUSTOM_VECTOR_OP
 template<typename size_type>
@@ -139,7 +141,7 @@ typedef struct {
     unsigned char side_index[MAX_SM];
 } param_sm_side_t;
 
-extern "C" __global__ LAUNCH_BOUNDS void side_aware_elementwise(
+extern "C" __global__ LAUNCH_BOUNDS void KERNEL_NAME(
         size_type num_vectors_16B,
         vo0* __restrict__ output0, vo1* __restrict__ output1,
         vo2* __restrict__ output2, vo3* __restrict__ output3,
@@ -295,25 +297,18 @@ extern "C" __global__ LAUNCH_BOUNDS void side_aware_elementwise(
 )SIDEAWARE_KERNEL";
 
 // ---------------------------------------------------------------------------
-// Global configuration variables
-// ---------------------------------------------------------------------------
-static size_t g_custom_alloc_threshold = 8ULL * 1024ULL * 1024ULL; // use custom allocator above this
-static size_t g_free_mapped_start_threshold = 16ULL * 1024ULL * 1024ULL * 1024ULL; // auto unmap on malloc above this
-static size_t g_free_mapped_end_threshold   = 2ULL  * 1024ULL * 1024ULL * 1024ULL; // stop auto unmapping at this point
-static int g_prealloc_extra_required = 1, g_prealloc_extra_alloc = 10; // configured by set_prealloc_config()
-static std::string g_sass_filename; // If empty, don't output SASS. Set via set_output_sass().
-static int g_num_devices = -1; // auto-init on 1st call to get_device_context()
-
-// ---------------------------------------------------------------------------
 // Compile Time Settings
 // ---------------------------------------------------------------------------
 //#define DEBUG_PRINTF
 constexpr bool   ALWAYS_OUTPUT_SASS = false;   // always output assembly to "sass" file (even if filename is empty)
+constexpr bool   ALWAYS_TRY_CUDA_FREE = true;  // cudaFreeAsync for unknown pointers (e.g. if alloc threshold changes)
+constexpr int    DEFAULT_PARALLEL_CHUNKS = 4;  // number of 256 threads "groups" (blockDim.y) per SM (max 4 on H100)
+constexpr bool   SYNC_ON_EVERY_ALLOC = false;  // sync when (pre)allocating memory to avoid confusing async errors
+constexpr bool   ZERO_ON_PREALLOC = false;     // zero out memory when preallocating physical memory
+
+constexpr int    MAX_SM = 640;                 // 640 SMs ought to be enough for anybody (kernels use real SM count)
 constexpr int    FORCED_HASH = 0;              // 0xB3000 for H100, 0xAB000 for GH200 96GiB, 0x1EF000 for GB200
 constexpr int    L2_SIDE_TEST_ITERATIONS = 25; // increases warmup time (at init & per page) but improves accuracy
-constexpr bool   TRY_CUDA_FREE_ON_MISS = true; // cudaFreeAsync for unknown pointers (e.g. if alloc threshold changes)
-
-constexpr int    MAX_SM = 512;                 // kernels are compiled with the actual number of SMs (this is CPU max)
 constexpr int    SIDE_HASH_BIT = 21;           // we force bit 21 of the virtual address to track the side of the page
 constexpr size_t CHUNK_BYTES = 4096;           // 4KiB (= granularity of side switch on H100/GB200)
 constexpr size_t PAGE_SIZE  = 2 * 1024 * 1024; // 2MiB (= granularity of NVIDIA MMU pages since Pascal)
@@ -326,6 +321,17 @@ constexpr int OFFSET_SIDE_HASH_MASK    = MAX_SM + 2;
 constexpr int OFFSET_NUM_SM_SIDE0      = MAX_SM + 3;
 constexpr int OFFSET_NUM_SM_SIDE1      = MAX_SM + 4;
 constexpr int OFFSET_MIN_SM_PER_SIDE   = MAX_SM + 5;
+
+// ---------------------------------------------------------------------------
+// Global configuration variables
+// ---------------------------------------------------------------------------
+static bool g_use_compression = false; // Enable CUDA compressible memory (release unused memory to avoid mixed reuse)
+static size_t g_custom_alloc_threshold = 8ULL * 1024ULL * 1024ULL; // use custom allocator above this
+static size_t g_free_mapped_start_threshold = 16ULL * 1024ULL * 1024ULL * 1024ULL; // auto unmap on malloc above this
+static size_t g_free_mapped_end_threshold   = 2ULL  * 1024ULL * 1024ULL * 1024ULL; // stop auto unmapping at this point
+static int g_prealloc_extra_required = 1, g_prealloc_extra_alloc = 10; // configured by set_prealloc_config()
+static std::string g_sass_filename; // If empty, don't output SASS. Set via set_output_sass().
+static int g_num_devices = -1; // auto-init on 1st call to get_device_context()
 
 // ---------------------------------------------------------------------------
 // Everything needed for side-aware page-based allocation
@@ -358,6 +364,7 @@ struct DeviceContext {
     // CPU memory (used on CPU or passed as kernel parameter)
     int cpu_side_info[MAX_SM * 2];
     ParamSmSide param_sm_side;
+    int side_summary[5];
 
     // GPU memory for side info
     unsigned int* gpu_allocator_metadata = nullptr;
@@ -669,8 +676,7 @@ static DeviceContext& get_device_context(int device=-1) {
     return ctx;
 }
 
-// NVRTC kernel compilation helper (for side_aware_memcpy)
-// TODO: this isn't actually memcpy anymore
+// NVRTC kernel compilation helper (for sideaware_elementwise)
 static CUfunction sideaware_get_kernel(DeviceContext &ctx, int kernel_id, bool use_slow_path) {
     assert(kernel_id < ctx.kernel_cache.size() && kernel_id < ctx.header_strings.size());
     DeviceContext::KernelCacheEntry &entry = ctx.kernel_cache[kernel_id];
@@ -692,8 +698,8 @@ static CUfunction sideaware_get_kernel(DeviceContext &ctx, int kernel_id, bool u
             "#define MAX_SM " + std::to_string(ctx.num_sms) + "\n" +
             "#define HASH " + std::to_string(hash_vector) + "\n";
         std::string variant_header = use_slow_path
-            ? " using size_type = long long;\n constexpr bool aligned_2MiB = false;\n"
-            : " using size_type = int;\n constexpr bool aligned_2MiB = true;\n";
+            ? "using size_type = long long;\nconstexpr bool aligned_2MiB = false;\n"
+            : "using size_type = int;\nconstexpr bool aligned_2MiB = true;\n";
         std::string combined_header = macro_header + variant_header + header_string;
 
         char *cubin = nullptr;
@@ -701,7 +707,7 @@ static CUfunction sideaware_get_kernel(DeviceContext &ctx, int kernel_id, bool u
         entry.module[idx] = loadCUBIN(cubin, cuDevice);
 
         CUfunction ftmp;
-        CUresult rc = cuModuleGetFunction(&ftmp, entry.module[idx], "side_aware_elementwise");
+        CUresult rc = cuModuleGetFunction(&ftmp, entry.module[idx], "sideaware_elementwise");
         if (rc != CUDA_SUCCESS) {
             const char *errStr = nullptr; cuGetErrorString(rc, &errStr);
             std::cerr << "Failed to get function: "
@@ -737,15 +743,15 @@ static void init_allocation_constraints(DeviceContext& ctx)
     }
 }
 
-static CUmemAllocationProp get_allocation_constraints(DeviceContext& ctx, bool use_compression=false)
+static CUmemAllocationProp get_allocation_constraints(DeviceContext& ctx, bool compression=false)
 {
-    use_compression &= ctx.compression_available;
+    compression &= ctx.compression_available;
 
     CUmemAllocationProp prop = {};
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
     prop.location.id = ctx.device_id;
-    prop.allocFlags.compressionType = (use_compression) ? CU_MEM_ALLOCATION_COMP_GENERIC : 0;
+    prop.allocFlags.compressionType = compression ? CU_MEM_ALLOCATION_COMP_GENERIC : 0;
     return prop;
 }
 
@@ -840,15 +846,14 @@ static size_t release_unused_memory_device(int device) {
 }
 
 // ---------------------------------------------------------------------------
-// Pre-allocate new physical handles (=2MiB pages of GPU physical memory)
-// Called when we run out but allocates some extra to reduce future calls
-// This is useful because this requires fully synchronous operations
+// KEY FUNCTION: This is where the magic happens!
+// Allocate physical memory and determine which side it's on and stores the
+// handles in per-side "free pools" for future mapping to virtual memory
+// (pre-allocate more than required because it causes a GPU sync)
 // ---------------------------------------------------------------------------
-static CUresult preallocate_handles(DeviceContext& ctx, int countNeeded, bool useCompression, cudaStream_t stream)
+static CUresult sideaware_preallocate(DeviceContext& ctx, int countNeeded, bool compression, cudaStream_t stream)
 {
-    if (countNeeded == 0) return CUDA_SUCCESS;
-
-    CUmemAllocationProp prop = get_allocation_constraints(ctx, useCompression);
+    CUmemAllocationProp prop = get_allocation_constraints(ctx, compression);
     CUresult lastError = CUDA_SUCCESS;
     int totalAllocated = 0;
 
@@ -905,18 +910,19 @@ static CUresult preallocate_handles(DeviceContext& ctx, int countNeeded, bool us
             break;
         }
 
-        // Zero out memory before using it (TODO: do we need this, or is it overkill?)
-        cudaDeviceSynchronize();
-        lastError = cuMemsetD8(dptr, 0, batchAllocated * PAGE_SIZE);
-        if (lastError != CUDA_SUCCESS) {
-            printf("ERROR: Failed to zero out memory before test (this should never happen?!)\n");
-            assert(false);
-            return lastError;
+        // Zero out memory before using it
+        if constexpr (ZERO_ON_PREALLOC) {
+            lastError = cuMemsetD8(dptr, 0, batchAllocated * PAGE_SIZE);
+            if (lastError != CUDA_SUCCESS) {
+                printf("ERROR: Failed to zero out memory before test (this should never happen?!)\n");
+                assert(false);
+                return lastError;
+            }
         }
 
         // Classify each page (side 0 or 1) by calling test_page_latency
-        test_page_latency<<<1, 512, 0, stream>>>(
-            reinterpret_cast<unsigned int*>(dptr), ctx.gpu_side_info, ctx.gpu_scratch_buffer, batchAllocated);
+        test_page_latency<<<1, 512, 0, stream>>>((unsigned int*)dptr, ctx.gpu_side_info,
+                                                 ctx.gpu_scratch_buffer, batchAllocated);
         cudaMemcpy(ctx.cpu_page_side, ctx.gpu_scratch_buffer, batchAllocated, cudaMemcpyDeviceToHost);
 
         // Unmap + place each handle in the correct side's pool
@@ -942,7 +948,7 @@ static CUresult preallocate_handles(DeviceContext& ctx, int countNeeded, bool us
     return lastError;
 }
 
-static CUresult ensure_handles_available(DeviceContext& ctx, size_t needed, bool useCompression, cudaStream_t stream)
+static CUresult sideaware_allocate_threshold(DeviceContext& ctx, size_t needed, bool compression, cudaStream_t stream)
 {
     size_t needed_per_side = (needed + g_prealloc_extra_required) / 2;
     size_t free0 = ctx.free_handles_side[0].size();
@@ -954,7 +960,7 @@ static CUresult ensure_handles_available(DeviceContext& ctx, size_t needed, bool
 
     if (needed_both_sides > 0) {
         needed_both_sides += g_prealloc_extra_alloc;
-        CUresult rc = preallocate_handles(ctx, needed_both_sides, useCompression, stream);
+        CUresult rc = sideaware_preallocate(ctx, needed_both_sides, compression, stream);
         return rc;
     }
     return CUDA_SUCCESS;
@@ -965,14 +971,22 @@ constexpr inline int side_from_virtual_address(uint64_t va)
     return (int)((va >> SIDE_HASH_BIT) & 1ULL);
 }
 
-static CUresult sideaware_allocate(DeviceContext& ctx, LargeAllocInfo &info, size_t size, bool use_compression=false)
+static CUresult sideaware_allocate(DeviceContext& ctx, LargeAllocInfo &info, size_t size, bool compression)
 {
     info.aligned_size = ((size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
-    info.use_compression = (use_compression && ctx.compression_available);
+    info.use_compression = (compression && ctx.compression_available);
 
-    // 1) Pre-check we have enough free handles, otherwise allocate more:
+    // Optional sync to make sure we catch all async errors before allocation
+    if constexpr (SYNC_ON_EVERY_ALLOC) {
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            printf("ERROR: cudaDeviceSynchronize() failed before allocation, unrelated async error?\n");
+            assert(false);
+        }
+    }
+
+    // 1) Pre-check we have enough free handles, otherwise allocate more
     size_t num_pages = info.aligned_size / PAGE_SIZE;
-    CUresult rc = ensure_handles_available(ctx, num_pages, info.use_compression, info.last_use_stream);
+    CUresult rc = sideaware_allocate_threshold(ctx, num_pages, info.use_compression, info.last_use_stream);
     if (rc != CUDA_SUCCESS) {
         return rc;
     }
@@ -1078,25 +1092,25 @@ static CUresult sideaware_allocate(DeviceContext& ctx, LargeAllocInfo &info, siz
         return rc;
     }
 
-    // 5) Zero memory to be safe (TODO: make this configurable)
-    cudaDeviceSynchronize();
-    rc = cuMemsetD8(basePtr, 0, info.aligned_size);
-    if (rc != CUDA_SUCCESS) {
-        // Cleanup on allocation failure
-        for (size_t i = 0; i < num_pages; i++) {
-            cuMemUnmap(basePtr + i * PAGE_SIZE, PAGE_SIZE);
-            ctx.free_handles_side[info.side_used[i]].push_back(info.handles[i]);
+    // 5) Optional sync to make sure we catch all async errors
+    if constexpr (SYNC_ON_EVERY_ALLOC) {
+        cudaError_t error = cudaDeviceSynchronize();
+        if (error != cudaSuccess) {
+            // Cleanup on allocation failure
+            for (size_t i = 0; i < num_pages; i++) {
+                cuMemUnmap(basePtr + i * PAGE_SIZE, PAGE_SIZE);
+                ctx.free_handles_side[info.side_used[i]].push_back(info.handles[i]);
+            }
+            cuMemAddressFree(allocPtr, extraSize);
+            return CUDA_ERROR_UNKNOWN;
         }
-        cuMemAddressFree(allocPtr, extraSize);
-        return rc;
     }
-
     return CUDA_SUCCESS;
 }
 
 static void* sideaware_reuse_allocation(DeviceContext& ctx, size_t alignedSize, cudaStream_t currentStream)
 {
-    auto &vec = ctx.large_alloc_cache[alignedSize];
+    auto &vec = ctx.large_alloc_cache[alignedSize + (int)g_use_compression];
     if (vec.empty()) return nullptr;
 
     LargeAllocInfo info = vec.back();
@@ -1121,7 +1135,7 @@ static void* sideaware_try_allocate(DeviceContext& ctx, size_t userSize, cudaStr
     LargeAllocInfo info;
     info.user_requested = userSize;
     info.last_use_stream = stream;
-    CUresult rc = sideaware_allocate(ctx, info, userSize);
+    CUresult rc = sideaware_allocate(ctx, info, userSize, g_use_compression);
     if (rc != CUDA_SUCCESS)
         return nullptr;
     ctx.large_alloc_registry[info.base_ptr] = info;
@@ -1136,36 +1150,35 @@ static void* sideaware_malloc_large(DeviceContext& ctx, size_t size, cudaStream_
     void* p = sideaware_reuse_allocation(ctx, alignedSize, stream);
     if (p) return p;
 
-    // 2a) Unmap free pages over threshold & try again
+    // 2) Unmap free pages over configurable threshold (then try allocating new pages for the 1st time)
     unmap_free_allocations(ctx, g_free_mapped_start_threshold, g_free_mapped_end_threshold);
     if (p = sideaware_try_allocate(ctx, size, stream)) return p;
 
-    // 2b) Unmap all free pages & try again
+    // 3) Unmap all free pages & try again
     unmap_free_allocations(ctx);
     if (p = sideaware_try_allocate(ctx, size, stream)) return p;
 
-    // 3) Try fully releasing all unused memory & try again
+    // 4) Try fully releasing all unused memory & try again (this shouldn't be required?)
     release_unused_memory_device(ctx.device_id);
     return sideaware_try_allocate(ctx, size, stream);
 }
 
-static void sideaware_free_large(DeviceContext& ctx, void* ptr, cudaStream_t stream)
+static void sideaware_free_large(DeviceContext& ctx, void* ptr, cudaStream_t stream, bool try_cuda_free = false)
 {
     if (!ptr) return;
     auto it = ctx.large_alloc_registry.find(ptr);
     if (it == ctx.large_alloc_registry.end()) {
-        if constexpr (TRY_CUDA_FREE_ON_MISS) {
+        if (ALWAYS_TRY_CUDA_FREE || try_cuda_free) {
             cudaFreeAsync(ptr, stream);
         } else {
-            printf("ERROR: Failed to find large allocation to free on device %d\n", ctx.device_id);
-            assert(false);
+            printf("ERROR: Failed to find large allocation %p to free on device %d\n", ptr, ctx.device_id);
         }
         return;
     }
 
     LargeAllocInfo info = it->second;
     ctx.large_alloc_registry.erase(it);
-    ctx.large_alloc_cache[info.aligned_size].push_back(info);
+    ctx.large_alloc_cache[info.aligned_size + (int)info.use_compression].push_back(info);
     ctx.total_mapped_free += info.aligned_size;
 }
 
@@ -1184,6 +1197,19 @@ void sideaware_free(void* ptr, cudaStream_t stream) {
     sideaware_free_large(get_device_context(), ptr, stream);
 }
 
+size_t sideaware_release_unused() {
+    size_t total_freed = 0;
+    for (size_t i = 0; i < g_deviceContexts.size(); i++) {
+        if (g_deviceContexts[i].initialized) {
+            total_freed += release_unused_memory_device(i);
+        }
+    }
+    return total_freed;
+}
+
+// ---------------------------------------------------------------------------
+// PyTorch interface (torch.cuda.memory.CUDAPluggableAllocator)
+// ---------------------------------------------------------------------------
 void* sideaware_malloc_auto(size_t size, int device, cudaStream_t stream) {
     debugf("sideaware_malloc_auto(%zu, %d, %p)\n", size, device, stream);
     void* p = nullptr;
@@ -1204,7 +1230,6 @@ void* sideaware_malloc_auto(size_t size, int device, cudaStream_t stream) {
             p = nullptr;
         }
     }
-
     return p;
 }
 
@@ -1215,27 +1240,13 @@ void sideaware_free_auto(void* ptr, size_t size, int device, cudaStream_t stream
     DeviceContext& ctx = get_device_context(device);
     ScopedSetDevice guard(device);
 
-    if (size >= g_custom_alloc_threshold) {
-        sideaware_free_large(ctx, ptr, stream);
-    } else {
-        cudaFreeAsync(ptr, stream);
-    }
-}
-
-size_t sideaware_release_unused() {
-    size_t total_freed = 0;
-    for (size_t i = 0; i < g_deviceContexts.size(); i++) {
-        if (g_deviceContexts[i].initialized) {
-            total_freed += release_unused_memory_device(i);
-        }
-    }
-    return total_freed;
+    bool try_cuda_free = size >= g_custom_alloc_threshold;
+    sideaware_free_large(ctx, ptr, stream, try_cuda_free);
 }
 
 // ---------------------------------------------------------------------------
-// Side Aware Elementwise GPU kernel launcher
+// Side Aware Elementwise GPU kernel launchers
 // kernel_id selects runtime‑compiled module to use (0 = default memcpy)
-// TODO: assumes device == current device, is this always true with PyTorch?
 // ---------------------------------------------------------------------------
 void sideaware_elementwise(int kernel_id,
                            size_t num_bytes,
@@ -1243,11 +1254,11 @@ void sideaware_elementwise(int kernel_id,
                            const void* in0, const void* in1, const void* in2, const void* in3,
                            void* sideband_memory, int sideband_value,
                            int parallel_chunks, int forced_per_side,
-                           int current_device,
-                           cudaStream_t stream)
+                           int device, cudaStream_t stream)
 {
     if (num_bytes == 0 || out0 == nullptr || in0 == nullptr) return;
-    DeviceContext& ctx = get_device_context(current_device);
+    ScopedSetDevice guard(device);
+    DeviceContext& ctx = get_device_context(device);
     CUstream cuStream = reinterpret_cast<CUstream>(stream);
 
     assert(kernel_id >= 0 && kernel_id < ctx.kernel_cache.size());
@@ -1257,7 +1268,7 @@ void sideaware_elementwise(int kernel_id,
     assert(num_bytes % 16 == 0);
 
     unsigned int sm_per_side = (forced_per_side > 0) ? forced_per_side : ctx.cpu_side_info[OFFSET_MIN_SM_PER_SIDE];
-    int num_groups = parallel_chunks > 0 ? parallel_chunks : 4;
+    int num_groups = parallel_chunks > 0 ? parallel_chunks : DEFAULT_PARALLEL_CHUNKS;
     long long num_vectors_64b = num_bytes / sizeof(uint4);
     int num_vectors_32b = (int)num_vectors_64b;
 
@@ -1295,54 +1306,48 @@ void sideaware_memcpy(void* out, const void* in, size_t num_bytes, int current_d
 }
 
 // ---------------------------------------------------------------------------
-// Compile a custom elementwise ops with provided header (compiled with NVRTC)
+// Compile custom elementwise kernel with provided header (compiled with NVRTC)
 // ---------------------------------------------------------------------------
 int sideaware_compile(const char* header, bool precompile) {
-    DeviceContext& ctx = get_device_context();
-
     if (!header || strlen(header)==0) {
         return 0; // ID 0 = memcpy
     }
 
+    int kernel_idx = -1;
     std::string hdr_str(header);
-    auto it = ctx.header_to_id.find(hdr_str);
-    if (it != ctx.header_to_id.end()) {
-        return it->second; // already assigned
-    }
 
-    int new_id = ctx.header_strings.size();
-    ctx.header_strings.push_back(hdr_str);
-    ctx.kernel_cache.emplace_back();
-    ctx.header_to_id[hdr_str] = new_id;
+    for (size_t i = 0; i < g_deviceContexts.size(); i++) {
+        DeviceContext& ctx = g_deviceContexts[i];
+        auto it = ctx.header_to_id.find(hdr_str);
+        if (it != ctx.header_to_id.end()) {
+            assert(i == 0 || kernel_idx == it->second);
+            kernel_idx = it->second;
+            continue;
+        }
+
+        int new_id = ctx.header_strings.size();
+        ctx.header_strings.push_back(hdr_str);
+        ctx.kernel_cache.emplace_back();
+        ctx.header_to_id[hdr_str] = new_id;
+
+        assert(i == 0 || kernel_idx == new_id);
+        kernel_idx = new_id;
+    }
 
     // Optionally precompile the kernel on the current device
     if (precompile) {
-        assert(sideaware_get_kernel(ctx, new_id, false) != nullptr);
-        assert(sideaware_get_kernel(ctx, new_id, true) != nullptr);
+        DeviceContext& ctx = get_device_context();
+        assert(sideaware_get_kernel(ctx, kernel_idx, false) != nullptr);
+        assert(sideaware_get_kernel(ctx, kernel_idx, true) != nullptr);
     }
-    return new_id;
+    return kernel_idx;
 }
 
 // ---------------------------------------------------------------------------
-// Additional query/utility/config (mostly per device)
+// Configuration functions
 // ---------------------------------------------------------------------------
-void fill_sm_sides_tensor(unsigned char* gpu_tensor) {
-    DeviceContext& ctx = get_device_context();
-    cudaError_t err = cudaMemcpy(gpu_tensor, ctx.gpu_side_index, ctx.num_sms, cudaMemcpyDeviceToDevice);
-    assert(err == cudaSuccess);
-}
-
-const int* get_sm_side_summary_ptr()
-{
-    static int s[5];
-    DeviceContext& ctx = get_device_context();
-
-    s[0] = ctx.num_sms;
-    s[1] = ctx.cpu_side_info[OFFSET_NUM_SM_SIDE0];
-    s[2] = ctx.cpu_side_info[OFFSET_NUM_SM_SIDE1];
-    s[3] = ctx.cpu_side_info[OFFSET_MIN_SM_PER_SIDE];
-    s[4] = ctx.cpu_side_info[OFFSET_SIDE_HASH_MASK];
-    return s;
+void use_compression(bool value) {
+    g_use_compression = value;
 }
 
 void set_custom_alloc_threshold(size_t threshold) {
@@ -1359,37 +1364,30 @@ void set_free_mapped_thresholds(size_t start_threshold, size_t end_threshold) {
     g_free_mapped_end_threshold = end_threshold;
 }
 
-void set_output_sass(const char* filename) {
-    g_sass_filename = (filename && filename[0]) ? filename : "";
-}
-
 // ---------------------------------------------------------------------------
-// Per-parameter query (rarely required)
+// Query functions
 // ---------------------------------------------------------------------------
-
-int get_num_sms() {
+void fill_sm_sides_tensor(unsigned char* gpu_tensor) {
     DeviceContext& ctx = get_device_context();
-    return ctx.num_sms;
+    cudaError_t err = cudaMemcpy(gpu_tensor, ctx.gpu_side_index, ctx.num_sms, cudaMemcpyDeviceToDevice);
+    assert(err == cudaSuccess);
 }
 
-int get_num_sm_side0() {
+const int* get_sm_side_summary_ptr()
+{
     DeviceContext& ctx = get_device_context();
-    return ctx.cpu_side_info[OFFSET_NUM_SM_SIDE0];
+    ctx.side_summary[0] = ctx.num_sms;
+    ctx.side_summary[1] = ctx.cpu_side_info[OFFSET_NUM_SM_SIDE0];
+    ctx.side_summary[2] = ctx.cpu_side_info[OFFSET_NUM_SM_SIDE1];
+    ctx.side_summary[3] = ctx.cpu_side_info[OFFSET_MIN_SM_PER_SIDE];
+    ctx.side_summary[4] = ctx.cpu_side_info[OFFSET_SIDE_HASH_MASK];
+    return ctx.side_summary;
 }
 
-int get_num_sm_side1() {
-    DeviceContext& ctx = get_device_context();
-    return ctx.cpu_side_info[OFFSET_NUM_SM_SIDE1];
-}
-
-int get_min_sm_per_side() {
-    DeviceContext& ctx = get_device_context();
-    return ctx.cpu_side_info[OFFSET_MIN_SM_PER_SIDE];
-}
-
-int get_hash_mask() {
-    DeviceContext& ctx = get_device_context();
-    return ctx.cpu_side_info[OFFSET_SIDE_HASH_MASK];
-}
+int get_num_sms() { return get_device_context().num_sms; }
+int get_num_sm_side0() { return get_device_context().cpu_side_info[OFFSET_NUM_SM_SIDE0]; }
+int get_num_sm_side1() { return get_device_context().cpu_side_info[OFFSET_NUM_SM_SIDE1]; }
+int get_min_sm_per_side() { return get_device_context().cpu_side_info[OFFSET_MIN_SM_PER_SIDE]; }
+int get_hash_mask() { return get_device_context().cpu_side_info[OFFSET_SIDE_HASH_MASK]; }
 
 } // extern "C"
