@@ -1,8 +1,8 @@
 // ---------------------------------------------------------------------------
-// [...]
+// TODO: Documentation...
 // ---------------------------------------------------------------------------
 // Example build & test command:
-// nvcc --gpu-architecture=native -Xcompiler -fPIC -shared alloc.cu -o alloc.so -lcuda -lnvrtc && python test.py
+// nvcc --gpu-architecture=native -Xcompiler -fPIC -shared sideaware.cu -o sideaware.so -lcuda -lnvrtc && python test.py
 // ---------------------------------------------------------------------------
 #include <cassert>
 #include <cstring>
@@ -21,27 +21,301 @@
 #include <string>
 #include <ctime>
 
+static const char* SIDEAWARE_MEMCPY_HEADER = R"SIDEAWARE_MEMCPY(
+typedef int o0;
+typedef int i0;
+
+struct unused {}; // optimized away by compiler
+typedef unused o1, o2, o3, i1, i2, i3;
+
+__device__ void elementwise_op(size_t element_idx,
+                               o0 &out0, o1 &out1,
+                               o2 &out2, o3 &out3,
+                               const i0 &in0, const i1 &in1,
+                               const i2 &in2, const i3 &in3) {
+    out0 = in0;
+}
+
+constexpr int unrolled = 4; // unrolled loop iterations (increases register pressure especially with multiple inputs)
+constexpr bool reverse_order = true; // process end of array 1st (maximise L2 hits with normal->reverse->normal->...)
+constexpr bool input_evict[4] = {true, true, true, true}; // do not keep inputs in L2 (more space for outputs)
+
+constexpr bool support_concurrent_kernels = false; // use atomics to dynamically assign SM side index
+constexpr bool input_discard[4] = {0}; // danger: discards from L2 *before* data is written to DRAM
+
+)SIDEAWARE_MEMCPY";
+
+static const char* SIDEAWARE_KERNEL_SOURCE = R"SIDEAWARE_KERNEL(
+// ----------------------------------------------------------------------------
+// L2 Side Aware Multi-Input / Multi-Output Elementwise kernel (16B alignment)
+// ----------------------------------------------------------------------------
+#include <cuda_runtime.h>
+
+#ifndef CUSTOM_VECTOR_OP
+template<typename size_type>
+__device__ void vector_op(size_type idx, int vec_size,
+                          o0 *out0, o1 *out1, o2 *out2, o3 *out3,
+                          const i0 *in0, const i1 *in1, const i2 *in2, const i3 *in3,
+                          int* sideband_memory, int sideband_value) {
+    for (int i = 0; i < vec_size; i++) {
+        elementwise_op(idx * vec_size + i, out0[i], out1[i], out2[i], out3[i], in0[i], in1[i], in2[i], in3[i]);
+    }
+}
+#endif
+
+#ifndef LAUNCH_BOUNDS
+#define LAUNCH_BOUNDS __launch_bounds__(1024, 1)
+#endif
+
+#ifndef FORCE_WRONG_SIDE
+#define FORCE_WRONG_SIDE false
+#endif
+
+#ifndef FORCE_RANDOM_SIDE
+#define FORCE_RANDOM_SIDE false
+#endif
+
+constexpr size_t vector_bytes = 16;
+constexpr bool sideaware_for_o0 = sizeof(o0) > sizeof(i0);
+constexpr int vec_size = vector_bytes / (sideaware_for_o0 ? sizeof(o0) : sizeof(i0));
+
+template<typename T, size_t N>
+struct packed {
+    T data[N];
+    __device__ __forceinline__ T& operator[](int index) { return data[index]; }
+    __device__ __forceinline__ const T& operator[](int index) const { return data[index]; }
+    __device__ __forceinline__ T* operator+() { return data; }
+    __device__ __forceinline__ const T* operator+() const { return data; }
+};
+
+typedef packed<o0, vec_size> vo0;
+typedef packed<o1, vec_size> vo1;
+typedef packed<o2, vec_size> vo2;
+typedef packed<o3, vec_size> vo3;
+typedef packed<i0, vec_size> vi0;
+typedef packed<i1, vec_size> vi1;
+typedef packed<i2, vec_size> vi2;
+typedef packed<i3, vec_size> vi3;
+
+template<bool evict = false, typename T>
+__device__ __forceinline__ T load(const T * __restrict__ src) {
+    if constexpr (sizeof(T) == 16) {
+        int4 data = evict ? __ldcs((const int4*)src) : __ldcg((const int4*)src);
+        return *(T*)&data;
+    } else if constexpr (sizeof(T) == 8) {
+        int2 data = evict ? __ldcs((const int2*)src) : __ldcg((const int2*)src);
+        return *(T*)&data;
+    } else if constexpr (sizeof(T) == 4) {
+        int data = evict ? __ldcs((const int*)src) : __ldcg((const int*)src);
+        return *(T*)&data;
+    }
+    return *src;
+}
+
+template<typename T>
+__device__ __forceinline__ void store(T* __restrict__ ptr, const T &value) {
+    T* aligned_ptr = (T*)__builtin_assume_aligned(ptr, sizeof(T));
+    aligned_ptr[0] = value;
+}
+
+template<typename T, typename U>
+struct is_same { static constexpr bool value = false; };
+template<typename T>
+struct is_same<T, T> { static constexpr bool value = true; };
+
+__device__ __forceinline__ void discard_inputs(
+    const vi0 * input0, const vi1 * input1, const vi2 * input2, const vi3 * input3) {
+    if (input_discard[0] && !is_same<i0, unused>::value && (unsigned long long)input0 % 128 == 0)
+        asm volatile("discard.global.L2 [%0], 128;\n" : : "l"(input0));
+    if (input_discard[1] && !is_same<i1, unused>::value && (unsigned long long)input1 % 128 == 0)
+        asm volatile("discard.global.L2 [%0], 128;\n" : : "l"(input1));
+    if (input_discard[2] && !is_same<i2, unused>::value && (unsigned long long)input2 % 128 == 0)
+        asm volatile("discard.global.L2 [%0], 128;\n" : : "l"(input2));
+    if (input_discard[3] && !is_same<i3, unused>::value && (unsigned long long)input3 % 128 == 0)
+        asm volatile("discard.global.L2 [%0], 128;\n" : : "l"(input3));
+}
+
+typedef struct {
+    unsigned char side_index[MAX_SM];
+} param_sm_side_t;
+
+extern "C" __global__ LAUNCH_BOUNDS void side_aware_elementwise(
+        size_type num_vectors_16B,
+        vo0* __restrict__ output0, vo1* __restrict__ output1,
+        vo2* __restrict__ output2, vo3* __restrict__ output3,
+        const vi0 * __restrict__ input0, const vi1 * __restrict__ input1,
+        const vi2 * __restrict__ input2, const vi3 * __restrict__ input3,
+        int* mem, int val,
+        unsigned int num_sm_per_side,
+        unsigned int* zeroed_scratch_buffer,
+        const param_sm_side_t params) {
+    // ...
+    unsigned int smid;
+    asm volatile("mov.u32 %0, %smid;\n" : "=r"(smid) :);
+    unsigned int sm_side = params.side_index[smid] & 1;
+    unsigned int sm_side_index;
+
+    if constexpr (support_concurrent_kernels) {
+        // Use atomics to dynamically assign SM side index
+        __shared__ unsigned int shared_sm_side_index;
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            sm_side_index = atomicInc(&zeroed_scratch_buffer[sm_side], 999);
+            if (sm_side_index >= num_sm_per_side) {
+                // Switch to the 'wrong side' as a failsafe so we still process every element
+                sm_side = 1 - sm_side;
+                sm_side_index = atomicInc(&zeroed_scratch_buffer[sm_side], 999);
+            }
+            unsigned int total_both_sides = atomicInc(&zeroed_scratch_buffer[2], 999);
+            if (total_both_sides >= gridDim.x - 1) {
+                zeroed_scratch_buffer[0] = 0;
+                zeroed_scratch_buffer[1] = 0;
+                zeroed_scratch_buffer[2] = 0;
+            }
+            shared_sm_side_index = sm_side_index;
+        }
+        __syncthreads();
+        sm_side_index = shared_sm_side_index;
+        if (sm_side_index >= num_sm_per_side) {
+            return;
+        }
+    } else {
+        // Use static side index (doesn't work if some SMs are not avaialble or grimDim != SM count)
+        sm_side_index = params.side_index[smid] >> 1;
+        if (sm_side_index >= num_sm_per_side) {
+            return;
+        }
+    }
+
+    int group = threadIdx.y;
+    int group_tid_offset = threadIdx.x;
+    int num_groups_per_side = num_sm_per_side * blockDim.y;
+
+    constexpr int CHUNK_BYTES = 4096;
+    constexpr int CHUNK_VECTORS = CHUNK_BYTES / vector_bytes;
+    constexpr int DOUBLE_CHUNK_VECTORS = 2 * CHUNK_VECTORS;
+    constexpr size_type offset_per_group = (unrolled * DOUBLE_CHUNK_VECTORS);
+
+    int num_double_chunks = num_vectors_16B / DOUBLE_CHUNK_VECTORS;
+    int multi_chunks = num_double_chunks / unrolled;
+
+    size_type offset_outer_loop = (offset_per_group * num_groups_per_side);
+    offset_outer_loop = (reverse_order ? -offset_outer_loop : offset_outer_loop);
+
+    int global_idx = (sm_side_index * blockDim.y) + group;
+    int adjusted_global_idx = reverse_order ? (multi_chunks - global_idx - 1) : global_idx;
+    size_type global_offset = adjusted_global_idx * offset_per_group + group_tid_offset;
+
+    unsigned int base = (sideaware_for_o0 ? (unsigned long long)output0 : (unsigned long long)input0) & 0xFFFFFFFFULL;
+    if constexpr (aligned_2MiB) {
+        if (base & (2*1024*1024)) {
+            sm_side ^= 1; // 2MiB aligned but not 4MiB aligned ==> invert side since bit 21 is in our custom hash
+        }
+        base = 0;
+    } else {
+        base /= vector_bytes;
+    }
+
+    size_type offsets[unrolled];
+    vi0 in0[unrolled];
+    vi1 in1[unrolled];
+    vi2 in2[unrolled];
+    vi3 in3[unrolled];
+    vo0 out0;
+    vo1 out1;
+    vo2 out2;
+    vo3 out3;
+
+    #pragma unroll 1
+    for (int i = global_idx; i < multi_chunks; i += num_groups_per_side, global_offset += offset_outer_loop) {
+        #pragma unroll unrolled
+        for (int j = 0; j < unrolled; j++) {
+            size_type inner_offset = global_offset + (j * DOUBLE_CHUNK_VECTORS);
+            unsigned int lsb_bits = base + (inner_offset & 0xFFFFFFFF);
+
+            int side = __popc(lsb_bits & HASH) & 1;
+            if constexpr (FORCE_WRONG_SIDE) side ^= 1;
+            if constexpr (FORCE_RANDOM_SIDE) side = 0;
+
+            int use_second_chunk = sm_side ^ side;
+            size_type offset = inner_offset + (use_second_chunk * CHUNK_VECTORS);
+
+            offsets[j] = offset;
+            in0[j] = load<input_evict[0]>(input0 + offset);
+            in1[j] = load<input_evict[1]>(input1 + offset);
+            in2[j] = load<input_evict[2]>(input2 + offset);
+            in3[j] = load<input_evict[3]>(input3 + offset);
+        }
+
+        #pragma unroll unrolled
+        for (int j = 0; j < unrolled; j++) {
+            size_type offset = offsets[j];
+            vector_op(offset, vec_size, +out0, +out1, +out2, +out3, +in0[j], +in1[j], +in2[j], +in3[j], mem, val);
+            store(output0 + offset, out0);
+            store(output1 + offset, out1);
+            store(output2 + offset, out2);
+            store(output3 + offset, out3);
+        }
+
+        #pragma unroll unrolled
+        for (int j = 0; j < unrolled; j++) {
+            size_type offset = offsets[j];
+            discard_inputs(input0 + offset, input1 + offset, input2 + offset, input3 + offset);
+        }
+    }
+
+    if (group == 0) {
+        int max_remaining_double_chunks = (num_double_chunks + 1) - (multi_chunks * unrolled);
+        int start_sm_side_idx = num_sm_per_side - max_remaining_double_chunks;
+        int idx = sm_side_index - start_sm_side_idx;
+        if (idx >= 0) {
+            size_type global_offset = (size_type)(idx + multi_chunks*unrolled) * DOUBLE_CHUNK_VECTORS;
+            global_offset += group_tid_offset;
+
+            unsigned int lsb_bits = base + (global_offset & 0xFFFFFFFF);
+            int side = __popc(lsb_bits & HASH) & 1;
+
+            int use_second_chunk = sm_side ^ side;
+            size_type offset = global_offset + (use_second_chunk * CHUNK_VECTORS);
+            if (offset < num_vectors_16B) {
+                in0[0] = load<input_evict[0]>(input0 + offset);
+                in1[0] = load<input_evict[1]>(input1 + offset);
+                in2[0] = load<input_evict[2]>(input2 + offset);
+                in3[0] = load<input_evict[3]>(input3 + offset);
+
+                vector_op(offset, vec_size, +out0, +out1, +out2, +out3, +in0[0], +in1[0], +in2[0], +in3[0], mem, val);
+                store(output0 + offset, out0);
+                store(output1 + offset, out1);
+                store(output2 + offset, out2);
+                store(output3 + offset, out3);
+                discard_inputs(input0 + offset, input1 + offset, input2 + offset, input3 + offset);
+            }
+        }
+    }
+}
+)SIDEAWARE_KERNEL";
+
 // ---------------------------------------------------------------------------
 // Global configuration variables
 // ---------------------------------------------------------------------------
-static int g_num_devices = -1; // init on 1st call to get_device_context()
-static int g_prealloc_extra_required = 1, g_prealloc_extra_alloc = 10; // configured by set_prealloc_config()
 static size_t g_custom_alloc_threshold = 8ULL * 1024ULL * 1024ULL; // use custom allocator above this
 static size_t g_free_mapped_start_threshold = 16ULL * 1024ULL * 1024ULL * 1024ULL; // auto unmap on malloc above this
 static size_t g_free_mapped_end_threshold   = 2ULL  * 1024ULL * 1024ULL * 1024ULL; // stop auto unmapping at this point
+static int g_prealloc_extra_required = 1, g_prealloc_extra_alloc = 10; // configured by set_prealloc_config()
 static std::string g_sass_filename; // If empty, don't output SASS. Set via set_output_sass().
+static int g_num_devices = -1; // auto-init on 1st call to get_device_context()
 
 // ---------------------------------------------------------------------------
 // Compile Time Settings
 // ---------------------------------------------------------------------------
 //#define DEBUG_PRINTF
-constexpr bool   ALWAYS_OUTPUT_SASS = true;    // always output assembly to "sass" file (even if filename is empty)
-constexpr int    MAX_SM = 200;                 // enough for all NVIDIA GPUs up to GB300 (but not e.g. MI300X!)
+constexpr bool   ALWAYS_OUTPUT_SASS = false;   // always output assembly to "sass" file (even if filename is empty)
 constexpr int    FORCED_HASH = 0;              // 0xB3000 for H100, 0xAB000 for GH200 96GiB, 0x1EF000 for GB200
 constexpr int    L2_SIDE_TEST_ITERATIONS = 25; // increases warmup time (at init & per page) but improves accuracy
 constexpr bool   TRY_CUDA_FREE_ON_MISS = true; // cudaFreeAsync for unknown pointers (e.g. if alloc threshold changes)
 
-constexpr size_t CHUNK_SIZE = 4096;            // 4KiB (= granularity of side switch on H100/GB200)
+constexpr int    MAX_SM = 512;                 // kernels are compiled with the actual number of SMs (this is CPU max)
+constexpr int    SIDE_HASH_BIT = 21;           // we force bit 21 of the virtual address to track the side of the page
+constexpr size_t CHUNK_BYTES = 4096;           // 4KiB (= granularity of side switch on H100/GB200)
 constexpr size_t PAGE_SIZE  = 2 * 1024 * 1024; // 2MiB (= granularity of NVIDIA MMU pages since Pascal)
 constexpr size_t UNBACKED_VIRTUAL_PAGES = 2048ULL * 1024ULL * 1024ULL / PAGE_SIZE; // maximum we allocate in one go
 
@@ -90,13 +364,12 @@ struct DeviceContext {
     unsigned int* gpu_side_info = nullptr;
     unsigned char* gpu_side_index = nullptr;
     unsigned char* gpu_scratch_buffer = nullptr;
-
+    unsigned char* gpu_scratch_zeroed_buffer = nullptr;
     // Unbacked virtual memory tracking
     unsigned char cpu_page_side[UNBACKED_VIRTUAL_PAGES];
 
     // Memory pools
-    std::vector<CUmemGenericAllocationHandle> free_handles_side0;
-    std::vector<CUmemGenericAllocationHandle> free_handles_side1;
+    std::vector<CUmemGenericAllocationHandle> free_handles_side[2];
     std::unordered_map<size_t, std::vector<LargeAllocInfo>> large_alloc_cache;
     std::unordered_map<void*, LargeAllocInfo> large_alloc_registry;
 
@@ -113,8 +386,8 @@ struct DeviceContext {
     // NVRTC kernel caching (indexed by header ID)
     // -------------------------------------------------------------------
     struct KernelCacheEntry {
-        CUmodule module = nullptr;                    // compiled module for header
-        CUfunction funcs[4] = {nullptr,nullptr,nullptr,nullptr};
+        CUmodule module[2] = {nullptr, nullptr};
+        CUfunction funcs[4] = {nullptr,nullptr};
     };
 
     std::vector<KernelCacheEntry> kernel_cache;       // index = header ID (0 default)
@@ -152,15 +425,10 @@ inline void __checkCudaErrors(T err, const char *file, const int line) {
 #endif
 
 // Compiles a CUDA source file (.cu) to CUBIN using NVRTC (asserts on failure)
-static void compileFileToCUBIN(CUdevice device, char **cubin_out, const char *filename,
+static void compileStringToCUBIN(CUdevice device, char **cubin_out, const char *source,
                               const char *header_code = nullptr, size_t *cubin_size_out = nullptr,
                               const char *include_path = "/usr/local/cuda/include/") {
-    assert(filename && *filename && "NVRTC requires a non-empty filename.");
-
-    std::ifstream file_stream(filename, std::ios::binary);
-    assert(file_stream && "Cannot open NVRTC source file.");
-
-    std::string source_code((std::istreambuf_iterator<char>(file_stream)), {});
+    std::string source_code(source);
     std::string final_source = header_code ? (std::string(header_code) + "\n" + source_code) : source_code;
 
     int major_cc, minor_cc; // this won't include optional 'a' suffix for e.g. H100 sm_90a
@@ -175,7 +443,7 @@ static void compileFileToCUBIN(CUdevice device, char **cubin_out, const char *fi
     for(const auto& s : opts_str) opts_c.push_back(s.c_str());
 
     nvrtcProgram program;
-    checkCudaErrors(nvrtcCreateProgram(&program, final_source.c_str(), filename, 0, nullptr, nullptr));
+    checkCudaErrors(nvrtcCreateProgram(&program, final_source.c_str(), "side_aware", 0, nullptr, nullptr));
     nvrtcResult compile_res = nvrtcCompileProgram(program, opts_c.size(), opts_c.data());
 
     size_t log_size = 0;
@@ -183,12 +451,12 @@ static void compileFileToCUBIN(CUdevice device, char **cubin_out, const char *fi
     if (log_size > 1) { // Print log even on success (for warnings)
         std::string log(log_size, '\0');
         checkCudaErrors(nvrtcGetProgramLog(program, &log[0]));
-        std::cerr << "NVRTC Log (" << filename << "):\n" << log << std::endl;
+        std::cerr << "NVRTC Log (Side Aware):\n" << log << std::endl;
     }
 
     if (compile_res != NVRTC_SUCCESS) {
         const char* error_string = nvrtcGetErrorString(compile_res);
-        std::cerr << "Error: NVRTC compilation failed for '" << filename
+        std::cerr << "Error: NVRTC compilation failed for 'Side Aware"
                   << "' with error: " << (error_string ? error_string : "Unknown NVRTC error")
                   << " (Code: " << compile_res << "). Check NVRTC log above for details.\n";
         checkCudaErrors(nvrtcDestroyProgram(&program));
@@ -281,7 +549,7 @@ __global__ void init_side_info(unsigned int* base_page, unsigned int *side_info,
         asm volatile("mov.u32 %0, %smid;\n" : "=r"(smid) :);
 
         int offset = 4 * smid;
-        assert(offset * sizeof(int) < CHUNK_SIZE);
+        assert(offset * sizeof(int) < CHUNK_BYTES);
 
         __nanosleep(((smid+4)% 16) * 2000 + 100);
         int total_latency = test_latency_l2(base_page, offset);
@@ -338,8 +606,8 @@ __global__ void init_side_info(unsigned int* base_page, unsigned int *side_info,
                 }
                 side_info[OFFSET_SIDE_HASH_MASK] = toggle_bits;
                 debugf("Detected side-hash bits: 0x%X\n", toggle_bits);
-                if (!(toggle_bits & CHUNK_SIZE) || (toggle_bits & (CHUNK_SIZE - 1))) {
-                    printf("\nERROR: CHUNK_SIZE %d doesn't work with hash %x\n\n", (int)CHUNK_SIZE, toggle_bits);
+                if (!(toggle_bits & CHUNK_BYTES) || (toggle_bits & (CHUNK_BYTES - 1))) {
+                    printf("\nERROR: CHUNK_BYTES %d doesn't work with hash %x\n\n", (int)CHUNK_BYTES, toggle_bits);
                     assert(false);
                 }
             } else {
@@ -403,34 +671,45 @@ static DeviceContext& get_device_context(int device=-1) {
 
 // NVRTC kernel compilation helper (for side_aware_memcpy)
 // TODO: this isn't actually memcpy anymore
-static CUfunction getMemcpyKernel(DeviceContext &ctx, int header_id, bool use_64bit) {
-    assert(header_id < ctx.kernel_cache.size() && header_id < ctx.header_strings.size());
-    DeviceContext::KernelCacheEntry &entry = ctx.kernel_cache[header_id];
+static CUfunction sideaware_get_kernel(DeviceContext &ctx, int kernel_id, bool use_slow_path) {
+    assert(kernel_id < ctx.kernel_cache.size() && kernel_id < ctx.header_strings.size());
+    DeviceContext::KernelCacheEntry &entry = ctx.kernel_cache[kernel_id];
 
-    int idx = use_64bit ? 1 : 0; // select variant
+    int idx = use_slow_path ? 1 : 0; // select variant
     if (entry.funcs[idx] == nullptr) {
-        assert(entry.module == nullptr);
+        assert(entry.module[idx] == nullptr);
 
         CUdevice cuDevice;
         cuCtxGetDevice(&cuDevice);
 
-        char *cubin = nullptr;
-        const std::string& s = ctx.header_strings[header_id];
-        const char* header_ptr = s.empty() ? nullptr : s.c_str();
-        compileFileToCUBIN(cuDevice, &cubin, "sideaware_kernels.cu", header_ptr);
-        entry.module = loadCUBIN(cubin, cuDevice);
+        const std::string& header_string = ctx.header_strings[kernel_id];
+        assert(header_string.empty() == false);
 
-        const char* fn_names[2] = { "side_aware_memcpy_32", "side_aware_memcpy_64" };
-        for (int i = 0; i < 2; i++) {
-            CUfunction ftmp;
-            CUresult rc = cuModuleGetFunction(&ftmp, entry.module, fn_names[i]);
-            if (rc != CUDA_SUCCESS) {
-                const char *errStr = nullptr; cuGetErrorString(rc,&errStr);
-                std::cerr << "Failed to get " << fn_names[i] << " : " << (errStr?errStr:"") << std::endl;
-                std::abort();
-            }
-            entry.funcs[i] = ftmp;
+        // Dynamically set MAX_SM and HASH for this device.
+        unsigned int hash = ctx.cpu_side_info[OFFSET_SIDE_HASH_MASK] | (1u << SIDE_HASH_BIT);
+        unsigned int hash_vector = hash / sizeof(uint4);
+        std::string macro_header =
+            "#define MAX_SM " + std::to_string(ctx.num_sms) + "\n" +
+            "#define HASH " + std::to_string(hash_vector) + "\n";
+        std::string variant_header = use_slow_path
+            ? " using size_type = long long;\n constexpr bool aligned_2MiB = false;\n"
+            : " using size_type = int;\n constexpr bool aligned_2MiB = true;\n";
+        std::string combined_header = macro_header + variant_header + header_string;
+
+        char *cubin = nullptr;
+        compileStringToCUBIN(cuDevice, &cubin, SIDEAWARE_KERNEL_SOURCE, combined_header.c_str());
+        entry.module[idx] = loadCUBIN(cubin, cuDevice);
+
+        CUfunction ftmp;
+        CUresult rc = cuModuleGetFunction(&ftmp, entry.module[idx], "side_aware_elementwise");
+        if (rc != CUDA_SUCCESS) {
+            const char *errStr = nullptr; cuGetErrorString(rc, &errStr);
+            std::cerr << "Failed to get function: "
+                      << (errStr ? errStr : "") << " (for kernel " << kernel_id
+                      << ", variant " << (use_slow_path ? 1 : 0) << ")" << std::endl;
+            std::abort();
         }
+        entry.funcs[idx] = ftmp;
     }
     return entry.funcs[idx];
 }
@@ -478,10 +757,13 @@ void DeviceContext::initialize(cudaStream_t stream) {
 
     init_allocation_constraints(*this);
     cudaMalloc(&gpu_allocator_metadata, PAGE_SIZE);
+    cudaMemset(gpu_allocator_metadata, 0, PAGE_SIZE);
     assert((uintptr_t)gpu_allocator_metadata % PAGE_SIZE == 0);
+
     gpu_side_info = &gpu_allocator_metadata[16 * 1024];
     gpu_side_index = (unsigned char*)&gpu_allocator_metadata[32 * 1024];
-    gpu_scratch_buffer = (unsigned char*)&gpu_allocator_metadata[128 * 1024];
+    gpu_scratch_buffer = (unsigned char*)&gpu_allocator_metadata[64 * 1024];
+    gpu_scratch_zeroed_buffer = (unsigned char*)&gpu_allocator_metadata[128 * 1024];
 
     init_side_info<<<num_sms, 512, 0, stream>>>(gpu_allocator_metadata, gpu_side_info, gpu_side_index);
 
@@ -494,6 +776,7 @@ void DeviceContext::initialize(cudaStream_t stream) {
     }
     header_strings.resize(1);
     kernel_cache.resize(1);
+    header_strings[0] = SIDEAWARE_MEMCPY_HEADER; // ID 0 = memcpy
 
     initialized = true;
 }
@@ -501,7 +784,7 @@ void DeviceContext::initialize(cudaStream_t stream) {
 // ---------------------------------------------------------------------------
 // Unmap free blocks if threshold is exceeded
 // ---------------------------------------------------------------------------
-static void unmapFreeLargeAllocations(DeviceContext& ctx, size_t start_threshold=0, size_t end_threshold=0) {
+static void unmap_free_allocations(DeviceContext& ctx, size_t start_threshold=0, size_t end_threshold=0) {
     if (ctx.total_mapped_free <= start_threshold) return;
 
     ScopedSetDevice guard(ctx.device_id);
@@ -521,11 +804,7 @@ static void unmapFreeLargeAllocations(DeviceContext& ctx, size_t start_threshold
                 cuMemUnmap(base + i * PAGE_SIZE, PAGE_SIZE);
                 // Return handle to the side it was allocated from:
                 int side = blk.side_used[i];
-                if (side == 0) {
-                    ctx.free_handles_side0.push_back(blk.handles[i]);
-                } else {
-                    ctx.free_handles_side1.push_back(blk.handles[i]);
-                }
+                ctx.free_handles_side[side].push_back(blk.handles[i]);
             }
             // Use alloc_ptr for freeing address space, not base_ptr
             cuMemAddressFree((CUdeviceptr)blk.alloc_ptr, blk.aligned_size + 2 * PAGE_SIZE);
@@ -545,20 +824,16 @@ static size_t release_unused_memory_device(int device) {
     ScopedSetDevice guard(device);
 
     // Unmap all cached blocks then release handles from side0/side1 pools
-    unmapFreeLargeAllocations(ctx);
+    unmap_free_allocations(ctx);
 
     size_t freed_memory = 0;
-    for (auto &h : ctx.free_handles_side0) {
-        cuMemRelease(h);
-        freed_memory += PAGE_SIZE;
+    for (int side = 0; side < 2; side++) {
+        for (auto &h : ctx.free_handles_side[side]) {
+            cuMemRelease(h);
+            freed_memory += PAGE_SIZE;
+        }
+        ctx.free_handles_side[side].clear();
     }
-    ctx.free_handles_side0.clear();
-
-    for (auto &h : ctx.free_handles_side1) {
-        cuMemRelease(h);
-        freed_memory += PAGE_SIZE;
-    }
-    ctx.free_handles_side1.clear();
 
     cudaDeviceSynchronize();
     return freed_memory;
@@ -569,7 +844,7 @@ static size_t release_unused_memory_device(int device) {
 // Called when we run out but allocates some extra to reduce future calls
 // This is useful because this requires fully synchronous operations
 // ---------------------------------------------------------------------------
-static CUresult preAllocateHandles(DeviceContext& ctx, int countNeeded, bool useCompression, cudaStream_t stream)
+static CUresult preallocate_handles(DeviceContext& ctx, int countNeeded, bool useCompression, cudaStream_t stream)
 {
     if (countNeeded == 0) return CUDA_SUCCESS;
 
@@ -648,11 +923,7 @@ static CUresult preAllocateHandles(DeviceContext& ctx, int countNeeded, bool use
         for (int i = 0; i < batchAllocated; i++) {
             cuMemUnmap(dptr + i * PAGE_SIZE, PAGE_SIZE);
             int side = ctx.cpu_page_side[i];
-            if (side == 0) {
-                ctx.free_handles_side0.push_back(tempHandles[i]);
-            } else {
-                ctx.free_handles_side1.push_back(tempHandles[i]);
-            }
+            ctx.free_handles_side[side].push_back(tempHandles[i]);
         }
         cuMemAddressFree(dptr, batch * PAGE_SIZE);
 
@@ -671,11 +942,11 @@ static CUresult preAllocateHandles(DeviceContext& ctx, int countNeeded, bool use
     return lastError;
 }
 
-static CUresult ensureFreeHandlesAvailable(DeviceContext& ctx, size_t needed, bool useCompression, cudaStream_t stream)
+static CUresult ensure_handles_available(DeviceContext& ctx, size_t needed, bool useCompression, cudaStream_t stream)
 {
     size_t needed_per_side = (needed + g_prealloc_extra_required) / 2;
-    size_t free0 = ctx.free_handles_side0.size();
-    size_t free1 = ctx.free_handles_side1.size();
+    size_t free0 = ctx.free_handles_side[0].size();
+    size_t free1 = ctx.free_handles_side[1].size();
     size_t needed_side0 = (needed_per_side > free0) ? (needed_per_side - free0) : 0;
     size_t needed_side1 = (needed_per_side > free1) ? (needed_per_side - free1) : 0;
     size_t needed_worst_case = max(needed_side0, needed_side1);
@@ -683,25 +954,25 @@ static CUresult ensureFreeHandlesAvailable(DeviceContext& ctx, size_t needed, bo
 
     if (needed_both_sides > 0) {
         needed_both_sides += g_prealloc_extra_alloc;
-        CUresult rc = preAllocateHandles(ctx, needed_both_sides, useCompression, stream);
+        CUresult rc = preallocate_handles(ctx, needed_both_sides, useCompression, stream);
         return rc;
     }
     return CUDA_SUCCESS;
 }
 
-constexpr inline int pickSideFromVA(uint64_t va)
+constexpr inline int side_from_virtual_address(uint64_t va)
 {
-    return (int)((va >> 21) & 1ULL);
+    return (int)((va >> SIDE_HASH_BIT) & 1ULL);
 }
 
-static CUresult allocateCompressible(DeviceContext& ctx, LargeAllocInfo &info, size_t size, bool use_compression=false)
+static CUresult sideaware_allocate(DeviceContext& ctx, LargeAllocInfo &info, size_t size, bool use_compression=false)
 {
     info.aligned_size = ((size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
     info.use_compression = (use_compression && ctx.compression_available);
 
     // 1) Pre-check we have enough free handles, otherwise allocate more:
     size_t num_pages = info.aligned_size / PAGE_SIZE;
-    CUresult rc = ensureFreeHandlesAvailable(ctx, num_pages, info.use_compression, info.last_use_stream);
+    CUresult rc = ensure_handles_available(ctx, num_pages, info.use_compression, info.last_use_stream);
     if (rc != CUDA_SUCCESS) {
         return rc;
     }
@@ -709,8 +980,8 @@ static CUresult allocateCompressible(DeviceContext& ctx, LargeAllocInfo &info, s
     // Determine the desired "start side" for this allocation size
     // If we haven't seen this size before, choose the side with fewer handles
     if (ctx.size_side_map.find(info.aligned_size) == ctx.size_side_map.end()) {
-        int side0_free = ctx.free_handles_side0.size();
-        int side1_free = ctx.free_handles_side1.size();
+        int side0_free = ctx.free_handles_side[0].size();
+        int side1_free = ctx.free_handles_side[1].size();
         ctx.size_side_map[info.aligned_size] = (side0_free >= side1_free) ? 0 : 1;
     }
     int desiredStartSide = ctx.size_side_map[info.aligned_size];
@@ -728,15 +999,15 @@ static CUresult allocateCompressible(DeviceContext& ctx, LargeAllocInfo &info, s
     CUdeviceptr basePtr = allocPtr;
 
     // If the first page is not on the desired side, try the second page
-    int firstPageSide = pickSideFromVA((uint64_t)basePtr);
+    int firstPageSide = side_from_virtual_address((uint64_t)basePtr);
     if (firstPageSide != desiredStartSide) {
         basePtr += PAGE_SIZE; // Skip to next 2MiB page
     }
 
     // Verify that this page has the desired side
-    int basePageSide = pickSideFromVA((uint64_t)basePtr);
+    int basePageSide = side_from_virtual_address((uint64_t)basePtr);
     if (basePageSide != desiredStartSide) {
-        // This should never happen with our hash function using bit 21?!
+        // This should never happen with our hash function using bit 21?! (assuming SIDE_HASH_BIT = 21)
         printf("ERROR: Failed to find desired side in 2 consecutive 2MiB pages\n");
         cuMemAddressFree(allocPtr, extraSize);
         return CUDA_ERROR_UNKNOWN;
@@ -750,13 +1021,11 @@ static CUresult allocateCompressible(DeviceContext& ctx, LargeAllocInfo &info, s
     // 3) Map each page from whichever side is indicated by bit 21
     for (size_t i = 0; i < num_pages; i++) {
         uint64_t thisVa = (uint64_t)(basePtr + i * PAGE_SIZE);
-        int desiredSide = pickSideFromVA(thisVa);
+        int desiredSide = side_from_virtual_address(thisVa);
 
         // pop from the correct side if available
-        std::vector<CUmemGenericAllocationHandle>* correctPool =
-            (desiredSide == 0) ? &ctx.free_handles_side0 : &ctx.free_handles_side1;
-        std::vector<CUmemGenericAllocationHandle>* otherPool   =
-            (desiredSide == 0) ? &ctx.free_handles_side1 : &ctx.free_handles_side0;
+        std::vector<CUmemGenericAllocationHandle>* correctPool = &ctx.free_handles_side[desiredSide];
+        std::vector<CUmemGenericAllocationHandle>* otherPool   = &ctx.free_handles_side[1 - desiredSide];
 
         if (!correctPool->empty()) {
             info.handles[i] = correctPool->back();
@@ -782,19 +1051,11 @@ static CUresult allocateCompressible(DeviceContext& ctx, LargeAllocInfo &info, s
         rc = cuMemMap(basePtr + i * PAGE_SIZE, PAGE_SIZE, 0, info.handles[i], 0);
         if (rc != CUDA_SUCCESS) {
             // Return the handle to whichever side we took it from
-            if (info.side_used[i] == 0) {
-                ctx.free_handles_side0.push_back(info.handles[i]);
-            } else {
-                ctx.free_handles_side1.push_back(info.handles[i]);
-            }
+            ctx.free_handles_side[info.side_used[i]].push_back(info.handles[i]);
             // Cleanup on allocation failure
             for (size_t j = 0; j < i; j++) {
                 cuMemUnmap(basePtr + j * PAGE_SIZE, PAGE_SIZE);
-                if (info.side_used[j] == 0) {
-                    ctx.free_handles_side0.push_back(info.handles[j]);
-                } else {
-                    ctx.free_handles_side1.push_back(info.handles[j]);
-                }
+                ctx.free_handles_side[info.side_used[j]].push_back(info.handles[j]);
             }
             cuMemAddressFree(allocPtr, extraSize);
             return rc;
@@ -811,8 +1072,7 @@ static CUresult allocateCompressible(DeviceContext& ctx, LargeAllocInfo &info, s
         // Cleanup on allocation failure
         for (size_t i = 0; i < num_pages; i++) {
             cuMemUnmap(basePtr + i * PAGE_SIZE, PAGE_SIZE);
-            if (info.side_used[i] == 0) ctx.free_handles_side0.push_back(info.handles[i]);
-            else                       ctx.free_handles_side1.push_back(info.handles[i]);
+            ctx.free_handles_side[info.side_used[i]].push_back(info.handles[i]);
         }
         cuMemAddressFree(allocPtr, extraSize);
         return rc;
@@ -825,8 +1085,7 @@ static CUresult allocateCompressible(DeviceContext& ctx, LargeAllocInfo &info, s
         // Cleanup on allocation failure
         for (size_t i = 0; i < num_pages; i++) {
             cuMemUnmap(basePtr + i * PAGE_SIZE, PAGE_SIZE);
-            if (info.side_used[i] == 0) ctx.free_handles_side0.push_back(info.handles[i]);
-            else                       ctx.free_handles_side1.push_back(info.handles[i]);
+            ctx.free_handles_side[info.side_used[i]].push_back(info.handles[i]);
         }
         cuMemAddressFree(allocPtr, extraSize);
         return rc;
@@ -835,7 +1094,7 @@ static CUresult allocateCompressible(DeviceContext& ctx, LargeAllocInfo &info, s
     return CUDA_SUCCESS;
 }
 
-static void* sideaware_reuse_alloc(DeviceContext& ctx, size_t alignedSize, cudaStream_t currentStream)
+static void* sideaware_reuse_allocation(DeviceContext& ctx, size_t alignedSize, cudaStream_t currentStream)
 {
     auto &vec = ctx.large_alloc_cache[alignedSize];
     if (vec.empty()) return nullptr;
@@ -857,12 +1116,12 @@ static void* sideaware_reuse_alloc(DeviceContext& ctx, size_t alignedSize, cudaS
     return info.base_ptr;
 }
 
-static void* sideaware_new_alloc(DeviceContext& ctx, size_t userSize, cudaStream_t stream)
+static void* sideaware_try_allocate(DeviceContext& ctx, size_t userSize, cudaStream_t stream)
 {
     LargeAllocInfo info;
     info.user_requested = userSize;
     info.last_use_stream = stream;
-    CUresult rc = allocateCompressible(ctx, info, userSize);
+    CUresult rc = sideaware_allocate(ctx, info, userSize);
     if (rc != CUDA_SUCCESS)
         return nullptr;
     ctx.large_alloc_registry[info.base_ptr] = info;
@@ -874,17 +1133,20 @@ static void* sideaware_malloc_large(DeviceContext& ctx, size_t size, cudaStream_
     size_t alignedSize = ((size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
 
     // 1) Try exact-size reuse
-    void* p = sideaware_reuse_alloc(ctx, alignedSize, stream);
+    void* p = sideaware_reuse_allocation(ctx, alignedSize, stream);
     if (p) return p;
 
-    // 2) Unmap free pages if over threshold & try again
-    unmapFreeLargeAllocations(ctx, g_free_mapped_start_threshold, g_free_mapped_end_threshold);
-    p = sideaware_new_alloc(ctx, size, stream);
-    if (p) return p;
+    // 2a) Unmap free pages over threshold & try again
+    unmap_free_allocations(ctx, g_free_mapped_start_threshold, g_free_mapped_end_threshold);
+    if (p = sideaware_try_allocate(ctx, size, stream)) return p;
+
+    // 2b) Unmap all free pages & try again
+    unmap_free_allocations(ctx);
+    if (p = sideaware_try_allocate(ctx, size, stream)) return p;
 
     // 3) Try fully releasing all unused memory & try again
     release_unused_memory_device(ctx.device_id);
-    return sideaware_new_alloc(ctx, size, stream);
+    return sideaware_try_allocate(ctx, size, stream);
 }
 
 static void sideaware_free_large(DeviceContext& ctx, void* ptr, cudaStream_t stream)
@@ -912,8 +1174,18 @@ static void sideaware_free_large(DeviceContext& ctx, void* ptr, cudaStream_t str
 // ---------------------------------------------------------------------------
 extern "C" {
 
-void* sideaware_malloc(size_t size, int device, cudaStream_t stream) {
-    debugf("sideaware_malloc(%zu, %d, %p)\n", size, device, stream);
+void* sideaware_malloc(size_t size, cudaStream_t stream) {
+    debugf("sideaware_malloc(%zu, %p)\n", size, stream);
+    return sideaware_malloc_large(get_device_context(), size, stream);
+}
+
+void sideaware_free(void* ptr, cudaStream_t stream) {
+    debugf("sideaware_free(%p, %p)\n", ptr, stream);
+    sideaware_free_large(get_device_context(), ptr, stream);
+}
+
+void* sideaware_malloc_auto(size_t size, int device, cudaStream_t stream) {
+    debugf("sideaware_malloc_auto(%zu, %d, %p)\n", size, device, stream);
     void* p = nullptr;
     ScopedSetDevice guard(device);
     DeviceContext& ctx = get_device_context(device);
@@ -926,7 +1198,7 @@ void* sideaware_malloc(size_t size, int device, cudaStream_t stream) {
             return p;
         }
 
-        unmapFreeLargeAllocations(ctx);
+        unmap_free_allocations(ctx);
         err = cudaMallocAsync(&p, size, stream);
         if (err != cudaSuccess) {
             p = nullptr;
@@ -936,8 +1208,8 @@ void* sideaware_malloc(size_t size, int device, cudaStream_t stream) {
     return p;
 }
 
-void sideaware_free(void* ptr, size_t size, int device, cudaStream_t stream) {
-    debugf("sideaware_free(%p, %zu, %d, %p)\n", ptr, size, device, stream);
+void sideaware_free_auto(void* ptr, size_t size, int device, cudaStream_t stream) {
+    debugf("sideaware_free_auto(%p, %zu, %d, %p)\n", ptr, size, device, stream);
 
     if (!ptr) return;
     DeviceContext& ctx = get_device_context(device);
@@ -961,51 +1233,75 @@ size_t sideaware_release_unused() {
 }
 
 // ---------------------------------------------------------------------------
-// Generic element‑wise kernel launcher. header_id selects runtime‑compiled
-// module to use (0 = default memcpy).
+// Side Aware Elementwise GPU kernel launcher
+// kernel_id selects runtime‑compiled module to use (0 = default memcpy)
 // TODO: assumes device == current device, is this always true with PyTorch?
 // ---------------------------------------------------------------------------
-void sideaware_elementwise(void* dst, const void* src, size_t size, int device, cudaStream_t stream, int header_id) {
-    if (size == 0 || dst == nullptr || src == nullptr) return;
-    DeviceContext& ctx = get_device_context(device);
-    assert(header_id >= 0 && header_id < ctx.kernel_cache.size());
-
-    int sm_per_side = ctx.cpu_side_info[OFFSET_MIN_SM_PER_SIDE];
-
-    size_t num_elements = size / sizeof(uint4);
-    unsigned int num_elements_32b = (unsigned int)num_elements;
-    const uint4* src4 = (const uint4*)src;
-    uint4* dst4 = (uint4*)dst;
-
-    assert((intptr_t)dst4 % 16 == 0);
-    assert((intptr_t)src4 % 16 == 0);
-
-    bool use64 = (size >= 2ULL*1024*1024*1024);
-    CUfunction kernel = getMemcpyKernel(ctx, header_id, use64);
+void sideaware_elementwise(int kernel_id,
+                           size_t num_bytes,
+                           void* out0, void* out1, void* out2, void* out3,
+                           const void* in0, const void* in1, const void* in2, const void* in3,
+                           void* sideband_memory, int sideband_value,
+                           int parallel_chunks, int forced_per_side,
+                           int current_device,
+                           cudaStream_t stream)
+{
+    if (num_bytes == 0 || out0 == nullptr || in0 == nullptr) return;
+    DeviceContext& ctx = get_device_context(current_device);
     CUstream cuStream = reinterpret_cast<CUstream>(stream);
 
-    void* args[5];
-    args[0] = &dst4;
-    args[1] = &src4;
-    args[2] = use64 ? (void*)&num_elements : (void*)&num_elements_32b;
-    args[3] = &sm_per_side;
-    args[4] = &ctx.param_sm_side;
+    assert(kernel_id >= 0 && kernel_id < ctx.kernel_cache.size());
+    assert(forced_per_side < ctx.cpu_side_info[OFFSET_MIN_SM_PER_SIDE]);
+    assert((intptr_t)out0 % 16 == 0);
+    assert((intptr_t)in0 % 16 == 0);
+    assert(num_bytes % 16 == 0);
 
-    cuLaunchKernel(kernel, ctx.num_sms, 1, 1, 256, 4, 1, 0, cuStream, args, nullptr);
+    unsigned int sm_per_side = (forced_per_side > 0) ? forced_per_side : ctx.cpu_side_info[OFFSET_MIN_SM_PER_SIDE];
+    int num_groups = parallel_chunks > 0 ? parallel_chunks : 4;
+    long long num_vectors_64b = num_bytes / sizeof(uint4);
+    int num_vectors_32b = (int)num_vectors_64b;
+
+    bool misaligned_2MiB = ((intptr_t)in0 % (2ULL*1024*1024)) || ((intptr_t)out0 % (2ULL*1024*1024));
+    bool need_64b_indexing = (num_bytes < 2ULL*1024*1024*1024);
+    bool use_slow_path = need_64b_indexing || misaligned_2MiB;
+
+    void* args[14];
+    args[0] = use_slow_path ? (void*)&num_vectors_64b : (void*)&num_vectors_32b;
+    args[1] = &out0;
+    args[2] = &out1;
+    args[3] = &out2;
+    args[4] = &out3;
+    args[5] = &in0;
+    args[6] = &in1;
+    args[7] = &in2;
+    args[8] = &in3;
+    args[9] = &sideband_memory;
+    args[10] = &sideband_value;
+    args[11] = &sm_per_side;
+    args[12] = &ctx.gpu_scratch_zeroed_buffer;
+    args[13] = &ctx.param_sm_side;
+
+    CUfunction kernel = sideaware_get_kernel(ctx, kernel_id, use_slow_path);
+    cuLaunchKernel(kernel, ctx.num_sms, 1, 1, 256, num_groups, 1, 0, cuStream, args, nullptr);
 }
 
-void sideaware_memcpy(void* dst, const void* src, size_t size, int device, cudaStream_t stream) {
-    sideaware_elementwise(dst, src, size, device, stream, 0);
+void sideaware_one_to_one(int kernel_id, size_t num_bytes, void* out0, const void* in0, cudaStream_t stream) {
+    int current_device = get_device_context().device_id;
+    sideaware_elementwise(kernel_id, num_bytes, out0, 0, 0, 0, in0, 0, 0, 0, 0, 0, 0, 0, current_device, stream);
+}
+
+void sideaware_memcpy(void* out, const void* in, size_t num_bytes, int current_device, cudaStream_t stream) {
+    sideaware_elementwise(0, num_bytes, out, 0, 0, 0, in, 0, 0, 0, 0, 0, 0, 0, current_device, stream);
 }
 
 // ---------------------------------------------------------------------------
-// NVRTC: allow user to inject custom header code for future elementwise ops
+// Compile a custom elementwise ops with provided header (compiled with NVRTC)
 // ---------------------------------------------------------------------------
-int sideaware_set_custom_header(const char* header) {
+int sideaware_compile(const char* header, bool precompile) {
     DeviceContext& ctx = get_device_context();
 
     if (!header || strlen(header)==0) {
-        return 0; // default memcpy
+        return 0; // ID 0 = memcpy
     }
 
     std::string hdr_str(header);
@@ -1016,8 +1312,14 @@ int sideaware_set_custom_header(const char* header) {
 
     int new_id = ctx.header_strings.size();
     ctx.header_strings.push_back(hdr_str);
-    ctx.kernel_cache.emplace_back(); // default‑constructed
+    ctx.kernel_cache.emplace_back();
     ctx.header_to_id[hdr_str] = new_id;
+
+    // Optionally precompile the kernel on the current device
+    if (precompile) {
+        assert(sideaware_get_kernel(ctx, new_id, false) != nullptr);
+        assert(sideaware_get_kernel(ctx, new_id, true) != nullptr);
+    }
     return new_id;
 }
 

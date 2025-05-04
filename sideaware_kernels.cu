@@ -1,72 +1,98 @@
-// ---------------------------------------------------------------------------------
-// Runtime‑compiled side‑aware memcpy kernel collection.
-// ---------------------------------------------------------------------------------
+struct unused {};
+typedef int o0, i0;
+typedef unused o1, o2, o3, i1, i2, i3;
+
+__device__ void elementwise_op(size_t element_idx,
+                               o0 &out0, o1 &out1,
+                               o2 &out2, o3 &out3,
+                               const i0 &in0, const i1 &in1,
+                               const i2 &in2, const i3 &in3) {
+    out0 = in0;
+}
+
+constexpr int unrolled = 4; // unrolled loop iterations (increases register pressure especially with multiple inputs)
+constexpr bool reverse_order = true; // process end of array 1st (maximise L2 hits with normal->reverse->normal->...)
+constexpr bool input_evict[4] = {true, true, true, true}; // do not keep inputs in L2 (more space for outputs)
+
+constexpr bool support_concurrent_kernels = false; // use atomics to dynamically assign SM side index
+constexpr bool input_discard[4] = {0}; // danger: discards from L2 *before* data is written to DRAM
+
+// ----------------------------------------------------------------------------
+// L2 Side Aware Multi-Input / Multi-Output Elementwise kernel (16B alignment)
+// ----------------------------------------------------------------------------
 #include <cuda_runtime.h>
 
-// must match alloc.cu (TODO: dynamic)
-constexpr unsigned int HASH = 0x2B3000;
-constexpr unsigned int MAX_SM = 200;
-constexpr unsigned int NUM_GROUPS = 4;
-constexpr bool FORCE_WRONG_SIDE = false;
-constexpr bool FORCE_RANDOM_SIDE = false;
+#ifndef CUSTOM_VECTOR_OP
+template<typename size_type>
+__device__ void vector_op(size_type idx, int vec_size,
+                          o0 *out0, o1 *out1, o2 *out2, o3 *out3,
+                          const i0 *in0, const i1 *in1, const i2 *in2, const i3 *in3,
+                          int* sideband_memory, int sideband_value) {
+    for (int i = 0; i < vec_size; i++) {
+        elementwise_op(idx * vec_size + i, out0[i], out1[i], out2[i], out3[i], in0[i], in1[i], in2[i], in3[i]);
+    }
+}
+#endif
 
-constexpr unsigned int CHUNK_SIZE = 4096;
+#ifndef LAUNCH_BOUNDS
+#define LAUNCH_BOUNDS __launch_bounds__(1024, 1)
+#endif
+
+#ifndef FORCE_WRONG_SIDE
+#define FORCE_WRONG_SIDE false
+#endif
+
+#ifndef FORCE_RANDOM_SIDE
+#define FORCE_RANDOM_SIDE false
+#endif
+
+constexpr size_t vector_bytes = 16;
+constexpr bool sideaware_for_o0 = sizeof(o0) > sizeof(i0);
+constexpr int vec_size = vector_bytes / (sideaware_for_o0 ? sizeof(o0) : sizeof(i0));
+
+template<typename T, size_t N>
+struct packed {
+    T data[N];
+    __device__ __forceinline__ T& operator[](int index) { return data[index]; }
+    __device__ __forceinline__ const T& operator[](int index) const { return data[index]; }
+    __device__ __forceinline__ T* operator+() { return data; }
+    __device__ __forceinline__ const T* operator+() const { return data; }
+};
+
+typedef packed<o0, vec_size> vo0;
+typedef packed<o1, vec_size> vo1;
+typedef packed<o2, vec_size> vo2;
+typedef packed<o3, vec_size> vo3;
+typedef packed<i0, vec_size> vi0;
+typedef packed<i1, vec_size> vi1;
+typedef packed<i2, vec_size> vi2;
+typedef packed<i3, vec_size> vi3;
+
+template<bool evict = false, typename T>
+__device__ __forceinline__ T load(const T * __restrict__ src) {
+    if constexpr (sizeof(T) == 16) {
+        int4 data = evict ? __ldcs((const int4*)src) : __ldcg((const int4*)src);
+        return *(T*)&data;
+    } else if constexpr (sizeof(T) == 8) {
+        int2 data = evict ? __ldcs((const int2*)src) : __ldcg((const int2*)src);
+        return *(T*)&data;
+    } else if constexpr (sizeof(T) == 4) {
+        int data = evict ? __ldcs((const int*)src) : __ldcg((const int*)src);
+        return *(T*)&data;
+    }
+    return *src;
+}
+
+template<typename T>
+__device__ __forceinline__ void store(T* __restrict__ ptr, const T &value) {
+    T* aligned_ptr = (T*)__builtin_assume_aligned(ptr, sizeof(T));
+    aligned_ptr[0] = value;
+}
 
 template<typename T, typename U>
 struct is_same { static constexpr bool value = false; };
 template<typename T>
 struct is_same<T, T> { static constexpr bool value = true; };
-
-typedef struct {
-    unsigned char side_index[MAX_SM];
-} param_sm_side_t;
-
-struct unused {}; // type for inputs/outputs not used in the kernel
-
-template<typename T, size_t N>
-struct __align__(16) packed {
-    T data[N];
-    __device__ __forceinline__ T& operator[](int index) { return data[index]; }
-    __device__ __forceinline__ const T& operator[](int index) const { return data[index]; }
-};
-
-template<bool evict = false, typename T, size_t N>
-__device__ __forceinline__ packed<T, N> load(const packed<T, N> * __restrict__ src) {
-    if constexpr (evict) {
-        if constexpr (sizeof(T) * N == 16) {
-            int4 data = __ldcs((const int4*)src);
-            return *(packed<T, N>*)&data;
-        } else if constexpr (sizeof(T) * N == 8) {
-            int2 data = __ldcs((const int2*)src);
-            return *(packed<T, N>*)&data;
-        } else if constexpr (sizeof(T) * N == 4) {
-            int data = __ldcs((const int*)src);
-            return *(packed<T, N>*)&data;
-        }
-    }
-    return *src;
-}
-
-typedef unsigned int o0;
-typedef unused o1;
-typedef unsigned int i0;
-typedef unused i1;
-typedef unused i2;
-typedef unused i3;
-constexpr bool input_evict[4] = {true, true, true, true};
-constexpr bool input_discard[4] = {false, false, false, false};
-
-constexpr bool reverse_order = true;
-constexpr bool sideaware_for_o0 = false;
-constexpr int parallel_iterations = 4;
-constexpr int vec_size = 4;
-
-typedef packed<o0, vec_size> vo0;
-typedef packed<o1, vec_size> vo1;
-typedef packed<i0, vec_size> vi0;
-typedef packed<i1, vec_size> vi1;
-typedef packed<i2, vec_size> vi2;
-typedef packed<i3, vec_size> vi3;
 
 __device__ __forceinline__ void discard_inputs(
     const vi0 * input0, const vi1 * input1, const vi2 * input2, const vi3 * input3) {
@@ -80,160 +106,160 @@ __device__ __forceinline__ void discard_inputs(
         asm volatile("discard.global.L2 [%0], 128;\n" : : "l"(input3));
 }
 
-// ---------------------------------------------------------------------------------
-// L2 Side Aware Multi-Input / Multi-Output Elementwise kernel (requires 16B alignment)
-// ---------------------------------------------------------------------------------
+typedef struct {
+    unsigned char side_index[MAX_SM];
+} param_sm_side_t;
 
-template<typename size_type = long long>
-__device__ __forceinline__ void elementwise_op(
-        size_type element_idx, o0 &output0, o1 &output1,
-        const i0 &input0, const i1 &input1, const i2 &input2, const i3 &input3) {
-    // ...
-    output0 = (o0)(input0);
-    output1 = (o1)(input1);
-}
-
-template<typename size_type = long long>
-__device__ __forceinline__ void vector_op(
-        size_type vec_idx, vo0 &output0, vo1 &output1,
-        const vi0 &input0, const vi1 &input1, const vi2 &input2, const vi3 &input3) {
-    // ...
-    for (int i = 0; i < vec_size; i++) {
-        elementwise_op(vec_idx * vec_size + i, output0[i], output1[i], input0[i], input1[i], input2[i], input3[i]);
-    }
-}
-
-template<typename size_type = long long>
-__device__ __forceinline__ void side_aware_elementwise_device(
+extern "C" __global__ LAUNCH_BOUNDS void side_aware_elementwise(
+        size_type num_vectors_16B,
         vo0* __restrict__ output0, vo1* __restrict__ output1,
+        vo2* __restrict__ output2, vo3* __restrict__ output3,
         const vi0 * __restrict__ input0, const vi1 * __restrict__ input1,
         const vi2 * __restrict__ input2, const vi3 * __restrict__ input3,
-        size_type num_elements, unsigned int num_sm_per_side,
+        int* mem, int val,
+        unsigned int num_sm_per_side,
+        unsigned int* zeroed_scratch_buffer,
         const param_sm_side_t params) {
     // ...
     unsigned int smid;
     asm volatile("mov.u32 %0, %smid;\n" : "=r"(smid) :);
-
     unsigned int sm_side = params.side_index[smid] & 1;
-    unsigned int sm_side_index = params.side_index[smid] >> 1;
+    unsigned int sm_side_index;
 
-    if (sm_side_index >= num_sm_per_side) {
-        __nanosleep(1000);
-        return;
+    if constexpr (support_concurrent_kernels) {
+        // Use atomics to dynamically assign SM side index
+        __shared__ unsigned int shared_sm_side_index;
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            sm_side_index = atomicInc(&zeroed_scratch_buffer[sm_side], 999);
+            if (sm_side_index >= num_sm_per_side) {
+                // Switch to the 'wrong side' as a failsafe so we still process every element
+                sm_side = 1 - sm_side;
+                sm_side_index = atomicInc(&zeroed_scratch_buffer[sm_side], 999);
+            }
+            unsigned int total_both_sides = atomicInc(&zeroed_scratch_buffer[2], 999);
+            if (total_both_sides >= gridDim.x - 1) {
+                zeroed_scratch_buffer[0] = 0;
+                zeroed_scratch_buffer[1] = 0;
+                zeroed_scratch_buffer[2] = 0;
+            }
+            shared_sm_side_index = sm_side_index;
+        }
+        __syncthreads();
+        sm_side_index = shared_sm_side_index;
+        if (sm_side_index >= num_sm_per_side) {
+            return;
+        }
+    } else {
+        // Use static side index (doesn't work if some SMs are not avaialble or grimDim != SM count)
+        sm_side_index = params.side_index[smid] >> 1;
+        if (sm_side_index >= num_sm_per_side) {
+            return;
+        }
     }
 
-    // blockDim.x * element_size must equal CHUNK_SIZE (we check this on the host side)
-    // e.g. 256 threads * 16 bytes = 4096 bytes
-    constexpr size_type element_size = sideaware_for_o0 ? sizeof(vo0) : sizeof(vi0);
-
     int group = threadIdx.y;
-    int group_tid_offset = threadIdx.x * element_size;
-    int num_groups_per_side = num_sm_per_side * NUM_GROUPS;
+    int group_tid_offset = threadIdx.x;
+    int num_groups_per_side = num_sm_per_side * blockDim.y;
 
-    int num_double_chunks = (num_elements * element_size) / (2 * CHUNK_SIZE);
-    int multi_chunks = num_double_chunks / parallel_iterations;
+    constexpr int CHUNK_BYTES = 4096;
+    constexpr int CHUNK_VECTORS = CHUNK_BYTES / vector_bytes;
+    constexpr int DOUBLE_CHUNK_VECTORS = 2 * CHUNK_VECTORS;
+    constexpr size_type offset_per_group = (unrolled * DOUBLE_CHUNK_VECTORS);
 
-    size_type offset_per_group = (parallel_iterations * CHUNK_SIZE * 2);
+    int num_double_chunks = num_vectors_16B / DOUBLE_CHUNK_VECTORS;
+    int multi_chunks = num_double_chunks / unrolled;
+
     size_type offset_outer_loop = (offset_per_group * num_groups_per_side);
-    offset_outer_loop = (reverse_order ? -offset_outer_loop : offset_outer_loop) - offset_per_group;
+    offset_outer_loop = (reverse_order ? -offset_outer_loop : offset_outer_loop);
 
-    int global_idx = (sm_side_index * NUM_GROUPS) + group;
+    int global_idx = (sm_side_index * blockDim.y) + group;
     int adjusted_global_idx = reverse_order ? (multi_chunks - global_idx - 1) : global_idx;
-    size_type byte_offset = adjusted_global_idx * offset_per_group + group_tid_offset;
-    unsigned int base = (sideaware_for_o0 ? (unsigned long long)output0 : (unsigned long long)input0) & 0xFFFFFFFFULL;
+    size_type global_offset = adjusted_global_idx * offset_per_group + group_tid_offset;
 
-    size_type elements[parallel_iterations];
-    vi0 inputs0[parallel_iterations];
-    vi1 inputs1[parallel_iterations];
-    vi2 inputs2[parallel_iterations];
-    vi3 inputs3[parallel_iterations];
+    unsigned int base = (sideaware_for_o0 ? (unsigned long long)output0 : (unsigned long long)input0) & 0xFFFFFFFFULL;
+    if constexpr (aligned_2MiB) {
+        if (base & (2*1024*1024)) {
+            sm_side ^= 1; // 2MiB aligned but not 4MiB aligned ==> invert side since bit 21 is in our custom hash
+        }
+        base = 0;
+    } else {
+        base /= vector_bytes;
+    }
+
+    size_type offsets[unrolled];
+    vi0 in0[unrolled];
+    vi1 in1[unrolled];
+    vi2 in2[unrolled];
+    vi3 in3[unrolled];
     vo0 out0;
     vo1 out1;
-    int j;
+    vo2 out2;
+    vo3 out3;
 
     #pragma unroll 1
-    for (int i = global_idx; i < multi_chunks; i += num_groups_per_side, byte_offset += offset_outer_loop) {
-        #pragma unroll parallel_iterations
-        for (j = 0; j < parallel_iterations; j++, byte_offset += 2*CHUNK_SIZE) {
-            unsigned int lsb_bits = base + (byte_offset & 0xFFFFFFFF);
+    for (int i = global_idx; i < multi_chunks; i += num_groups_per_side, global_offset += offset_outer_loop) {
+        #pragma unroll unrolled
+        for (int j = 0; j < unrolled; j++) {
+            size_type inner_offset = global_offset + (j * DOUBLE_CHUNK_VECTORS);
+            unsigned int lsb_bits = base + (inner_offset & 0xFFFFFFFF);
 
-            unsigned int side = __popc(lsb_bits & HASH) & 1;
+            int side = __popc(lsb_bits & HASH) & 1;
             if constexpr (FORCE_WRONG_SIDE) side ^= 1;
             if constexpr (FORCE_RANDOM_SIDE) side = 0;
 
-            unsigned int use_second_chunk = sm_side ^ side;
-            size_type offset = byte_offset + (use_second_chunk * CHUNK_SIZE);
+            int use_second_chunk = sm_side ^ side;
+            size_type offset = inner_offset + (use_second_chunk * CHUNK_VECTORS);
 
-            size_type element = offset / element_size;
-            elements[j] = element;
-            inputs0[j] = load<input_evict[0]>(&input0[element]);
-            inputs1[j] = load<input_evict[1]>(&input1[element]);
-            inputs2[j] = load<input_evict[2]>(&input2[element]);
-            inputs3[j] = load<input_evict[3]>(&input3[element]);
+            offsets[j] = offset;
+            in0[j] = load<input_evict[0]>(input0 + offset);
+            in1[j] = load<input_evict[1]>(input1 + offset);
+            in2[j] = load<input_evict[2]>(input2 + offset);
+            in3[j] = load<input_evict[3]>(input3 + offset);
         }
 
-        #pragma unroll parallel_iterations
-        for (j = 0; j < parallel_iterations; j++) {
-            size_type element = elements[j];
-            discard_inputs(input0 + element, input1 + element, input2 + element, input3 + element);
+        #pragma unroll unrolled
+        for (int j = 0; j < unrolled; j++) {
+            size_type offset = offsets[j];
+            vector_op(offset, vec_size, +out0, +out1, +out2, +out3, +in0[j], +in1[j], +in2[j], +in3[j], mem, val);
+            store(output0 + offset, out0);
+            store(output1 + offset, out1);
+            store(output2 + offset, out2);
+            store(output3 + offset, out3);
         }
 
-        #pragma unroll parallel_iterations
-        for (j = 0; j < parallel_iterations; j++) {
-            size_type element = elements[j];
-            vector_op(element, out0, out1, inputs0[j], inputs1[j], inputs2[j], inputs3[j]);
-            output0[element] = out0;
-            output1[element] = out1;
+        #pragma unroll unrolled
+        for (int j = 0; j < unrolled; j++) {
+            size_type offset = offsets[j];
+            discard_inputs(input0 + offset, input1 + offset, input2 + offset, input3 + offset);
         }
     }
 
     if (group == 0) {
-        int max_remaining_double_chunks = (num_double_chunks + 1) - (multi_chunks * parallel_iterations);
+        int max_remaining_double_chunks = (num_double_chunks + 1) - (multi_chunks * unrolled);
         int start_sm_side_idx = num_sm_per_side - max_remaining_double_chunks;
         int idx = sm_side_index - start_sm_side_idx;
         if (idx >= 0) {
-            size_type byte_offset = (size_type)(idx + multi_chunks*parallel_iterations) * (2*CHUNK_SIZE) + group_tid_offset;
-            unsigned int lsb_bits = base + (byte_offset & 0xFFFFFFFF);
-            unsigned int side = __popc(lsb_bits & HASH) & 1;
+            size_type global_offset = (size_type)(idx + multi_chunks*unrolled) * DOUBLE_CHUNK_VECTORS;
+            global_offset += group_tid_offset;
 
-            unsigned int use_second_chunk = sm_side ^ side;
-            byte_offset += use_second_chunk * CHUNK_SIZE;
+            unsigned int lsb_bits = base + (global_offset & 0xFFFFFFFF);
+            int side = __popc(lsb_bits & HASH) & 1;
 
-            size_type element = byte_offset / element_size;
-            if (element < num_elements) {
-                j = 0;
-                inputs0[j] = load<input_evict[0]>(input0 + element);
-                inputs1[j] = load<input_evict[1]>(input1 + element);
-                inputs2[j] = load<input_evict[2]>(input2 + element);
-                inputs3[j] = load<input_evict[3]>(input3 + element);
-                discard_inputs(input0 + element, input1 + element, input2 + element, input3 + element);
+            int use_second_chunk = sm_side ^ side;
+            size_type offset = global_offset + (use_second_chunk * CHUNK_VECTORS);
+            if (offset < num_vectors_16B) {
+                in0[0] = load<input_evict[0]>(input0 + offset);
+                in1[0] = load<input_evict[1]>(input1 + offset);
+                in2[0] = load<input_evict[2]>(input2 + offset);
+                in3[0] = load<input_evict[3]>(input3 + offset);
 
-                vector_op(element, out0, out1, inputs0[j], inputs1[j], inputs2[j], inputs3[j]);
-                output0[element] = out0;
-                output1[element] = out1;
+                vector_op(offset, vec_size, +out0, +out1, +out2, +out3, +in0[0], +in1[0], +in2[0], +in3[0], mem, val);
+                store(output0 + offset, out0);
+                store(output1 + offset, out1);
+                store(output2 + offset, out2);
+                store(output3 + offset, out3);
+                discard_inputs(input0 + offset, input1 + offset, input2 + offset, input3 + offset);
             }
         }
     }
 }
-
-// ---------------------------------------------------------------------------------
-// Explicit wrapper kernels (external names – easier to locate with cuModuleGetFunction)
-// ---------------------------------------------------------------------------------
-
-extern "C" {
-
-__global__ __launch_bounds__(1024, 1) void side_aware_memcpy_32(vo0* __restrict__ dst, const vi0* __restrict__ src,
-        unsigned int num_elements, unsigned int sm_per_side, __grid_constant__ const param_sm_side_t params) {
-
-    side_aware_elementwise_device<int>(dst, nullptr, src, nullptr, nullptr, nullptr,
-                                                num_elements, sm_per_side, params);
-}
-
-__global__ __launch_bounds__(1024, 1) void side_aware_memcpy_64(vo0* __restrict__ dst, const vi0* __restrict__ src,
-        size_t num_elements, unsigned int sm_per_side, __grid_constant__ const param_sm_side_t params) {
-
-    side_aware_elementwise_device<long long>(dst, nullptr, src, nullptr, nullptr, nullptr,
-                                          num_elements, sm_per_side, params);
-}
-
-} // extern "C"

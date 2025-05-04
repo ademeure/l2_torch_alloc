@@ -4,63 +4,62 @@ import ctypes
 import numpy as np
 import time
 
-# Load the allocator
-new_alloc = torch.cuda.memory.CUDAPluggableAllocator(
-    './alloc.so', 'sideaware_malloc', 'sideaware_free')
-# # Swap the current allocator
-torch.cuda.memory.change_current_allocator(new_alloc)
+# Use the sideaware allocator
+sideaware_alloc = torch.cuda.memory.CUDAPluggableAllocator('./sideaware.so', 'sideaware_malloc_auto', 'sideaware_free_auto')
+torch.cuda.memory.change_current_allocator(sideaware_alloc)
 
-# Load the shared library directly for accessing other functions
-alloc_lib = ctypes.CDLL('./alloc.so')
+# Load the allocator's library directly to access other functions
+lib = ctypes.CDLL('./sideaware.so')
 
-# Define the function signatures for the new interface
-alloc_lib.fill_sm_sides_tensor.argtypes = [ctypes.c_void_p]
-alloc_lib.fill_sm_sides_tensor.restype = ctypes.c_bool
+# Sideaware memcpy (i.e. "default kernel" when no custom kernel is provided via sideaware_compile)
+lib.sideaware_memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
+lib.sideaware_memcpy.restype = None
+
+# Compile custom elementwise function (returns kernel_id which can be passed to sideaware_elementwise)
+lib.sideaware_compile.argtypes = [ctypes.c_char_p, ctypes.c_bool]
+lib.sideaware_compile.restype = ctypes.c_int
+
+# Sideaware single-input / single-output elementwise API (simple version)
+lib.sideaware_one_to_one.argtypes = [ctypes.c_int, ctypes.c_size_t, # kernel_id, num_bytes
+                                           ctypes.c_void_p, ctypes.c_void_p, # out0, in0
+                                           ctypes.c_void_p] # stream
+lib.sideaware_one_to_one.restype = None
+
+# Sideaware multi-input / multi-output elementwise API (advanced version)
+lib.sideaware_elementwise.argtypes = [ctypes.c_int, ctypes.c_size_t, # kernel_id, num_bytes
+                                      ctypes.c_void_p, ctypes.c_void_p, # out0, out1
+                                      ctypes.c_void_p, ctypes.c_void_p, # out2, out3
+                                      ctypes.c_void_p, ctypes.c_void_p, # in0, in1
+                                      ctypes.c_void_p, ctypes.c_void_p, # in2, in3
+                                      ctypes.c_void_p, ctypes.c_void_p, # sideband_ptr, sideband_value
+                                      ctypes.c_int, ctypes.c_int, # parallel_chunks, forced_sm_per_side
+                                      ctypes.c_int, ctypes.c_void_p] # device, stream
+lib.sideaware_elementwise.restype = None
+
+# Useful for custom kernels (e.g. matmul with sideaware B matrix) and debug logs
+lib.fill_sm_sides_tensor.argtypes = [ctypes.c_void_p]
+lib.fill_sm_sides_tensor.restype = ctypes.c_bool
 
 # Returns (num_sms, num_side0, num_side1, min_sm_per_side, hash_mask)
-alloc_lib.get_sm_side_summary_ptr.argtypes = []
-alloc_lib.get_sm_side_summary_ptr.restype = ctypes.POINTER(ctypes.c_int * 5)
+lib.get_sm_side_summary_ptr.argtypes = []
+lib.get_sm_side_summary_ptr.restype = ctypes.POINTER(ctypes.c_int * 5)
 def get_sm_side_summary():
-    return tuple(alloc_lib.get_sm_side_summary_ptr().contents)
-
-# Setup sideaware_memcpy function (this is what gets called as torch.ops.sideaware.memcpy)
-# void sideaware_memcpy(void* dst, const void* src, size_t size, int device, cudaStream_t stream)
-alloc_lib.sideaware_memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
-alloc_lib.sideaware_memcpy.restype = None
-
-# Expose function to update the custom NVRTC header (triggers recompilation on next call)
-# sideaware_set_custom_header returns int header_id
-alloc_lib.sideaware_set_custom_header.argtypes = [ctypes.c_char_p]
-alloc_lib.sideaware_set_custom_header.restype = ctypes.c_int
-
-# elementwise (generic) API
-alloc_lib.sideaware_elementwise.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
-alloc_lib.sideaware_elementwise.restype = None
+    return tuple(lib.get_sm_side_summary_ptr().contents)
 
 # Helper function to get SM side & index as a PyTorch tensor
 def get_sm_side_index_tensor():
-    # Need to allocate something first to trigger initialization
-    dummy = torch.empty((1,), dtype=torch.uint8, device="cuda")
-
     num_sms, _, _, _, _ = get_sm_side_summary()
-    assert num_sms > 0
-
     sides_tensor = torch.zeros(num_sms, dtype=torch.uint8, device="cuda")
     tensor_ptr = sides_tensor.data_ptr()
-    alloc_lib.fill_sm_sides_tensor(tensor_ptr)
+    lib.fill_sm_sides_tensor(tensor_ptr)
     return sides_tensor
 
+# Returns dictionary version of get_sm_side_summary()
 def get_sm_sides_metadata():
-    num_sms, num_side0, num_side1, min_side, hash_mask = get_sm_side_summary()
-    return {
-        "num_sms": num_sms,
-        "num_side0": num_side0,
-        "num_side1": num_side1,
-        "min_sm_per_side": min_side,
-        "hash_mask": hash_mask,
-    }
+    num_sms, num_side0, num_side1, min_side, hash = get_sm_side_summary()
+    return { "num_sms": num_sms, "num_side0": num_side0, "num_side1": num_side1, "min_side": min_side, "hash": hash }
 
-# Define the PyTorch operator for manual memcpy
+# Define the PyTorch operators for sideaware memcpy, sideaware one_to_one, and sideaware elementwise
 def sideaware_memcpy(dst: torch.Tensor, src: torch.Tensor) -> None:
     """
     Performs a manual memcpy from src tensor to dst tensor.
@@ -78,30 +77,86 @@ def sideaware_memcpy(dst: torch.Tensor, src: torch.Tensor) -> None:
     # Get pointers and size
     dst_ptr = dst.data_ptr()
     src_ptr = src.data_ptr()
-    size_in_bytes = src.numel() * src.element_size()
+    num_bytes = src.numel() * src.element_size()
 
     # Make sure src and dst are contiguous and aligned
     assert src.is_contiguous(), "Source tensor must be contiguous"
     assert dst.is_contiguous(), "Destination tensor must be contiguous"
     assert (dst_ptr % 16 == 0) and (src_ptr % 16 == 0), "Destination and source must be 16-byte aligned"
 
-    # Get the current CUDA stream
-    device = torch.cuda.current_device()
-    stream = torch.cuda.current_stream(device)
+    # Call our C function
+    lib.sideaware_memcpy(dst_ptr, src_ptr, num_bytes, torch.cuda.current_device(), torch.cuda.current_stream())
+
+def sideaware_one_to_one(kernel_id: int, dst: torch.Tensor, src: torch.Tensor) -> None:
+    assert dst is not None or src is not None
+    src_bytes = dst is not None and dst.numel() * dst.element_size() or 0
+    dst_bytes = dst is not None and dst.numel() * dst.element_size() or 0
+    num_bytes = max(src_bytes, dst_bytes)
+
+    # Make sure src and dst are contiguous and aligned
+    assert src is None or (src.is_contiguous() and src.device.type == "cuda"), "Source tensor 0 must be contiguous"
+    assert dst is None or (dst.is_contiguous() and dst.device.type == "cuda"), "Destination tensor 0 must be contiguous"
+
+    # Get pointers and size
+    dst_ptr = dst is not None and dst.data_ptr() or 0
+    src_ptr = src is not None and src.data_ptr() or 0
+    assert dst_ptr % 16 == 0 and src_ptr % 16 == 0, "Destination and source tensors must be 16-byte aligned"
 
     # Call our C function
-    alloc_lib.sideaware_memcpy(dst_ptr, src_ptr, size_in_bytes, device, stream)
+    lib.sideaware_one_to_one(kernel_id, num_bytes, dst_ptr, src_ptr,
+                             torch.cuda.current_device(), torch.cuda.current_stream())
+
+def sideaware_elementwise(kernel_id: int,
+                          out0: torch.Tensor, out1: torch.Tensor, out2: torch.Tensor, out3: torch.Tensor,
+                          in0: torch.Tensor, in1: torch.Tensor, in2: torch.Tensor, in3: torch.Tensor,
+                          sideband_tensor: torch.Tensor = None, sideband_value: int = 0,
+                          parallel_chunks: int = 0, forced_sm_per_side: int = 0) -> None:
+    assert out0 is not None or in0 is not None
+    src_bytes = out0 is not None and out0.numel() * out0.element_size() or 0
+    dst_bytes = out0 is not None and out0.numel() * out0.element_size() or 0
+    num_bytes = max(src_bytes, dst_bytes)
+
+    # Make sure src and dst are contiguous and aligned
+    assert in0 is None or (in0.is_contiguous() and in0.device.type == "cuda"), "Source tensor 0 must be contiguous"
+    assert in1 is None or (in1.is_contiguous() and in1.device.type == "cuda"), "Source tensor 1 must be contiguous"
+    assert in2 is None or (in2.is_contiguous() and in2.device.type == "cuda"), "Source tensor 2 must be contiguous"
+    assert in3 is None or (in3.is_contiguous() and in3.device.type == "cuda"), "Source tensor 3 must be contiguous"
+    assert out0 is None or (out0.is_contiguous() and out0.device.type == "cuda"), "Destination tensor 0 must be contiguous"
+    assert out1 is None or (out1.is_contiguous() and out1.device.type == "cuda"), "Destination tensor 1 must be contiguous"
+    assert out2 is None or (out2.is_contiguous() and out2.device.type == "cuda"), "Destination tensor 2 must be contiguous"
+    assert out3 is None or (out3.is_contiguous() and out3.device.type == "cuda"), "Destination tensor 3 must be contiguous"
+
+    # Get pointers and size
+    out0_ptr = out0 is not None and out0.data_ptr() or 0
+    out1_ptr = out1 is not None and out1.data_ptr() or 0
+    out2_ptr = out2 is not None and out2.data_ptr() or 0
+    out3_ptr = out3 is not None and out3.data_ptr() or 0
+    in0_ptr = in0 is not None and in0.data_ptr() or 0
+    in1_ptr = in1 is not None and in1.data_ptr() or 0
+    in2_ptr = in2 is not None and in2.data_ptr() or 0
+    in3_ptr = in3 is not None and in3.data_ptr() or 0
+    sideband_ptr = sideband_tensor is not None and sideband_tensor.data_ptr() or 0
+
+    assert out0_ptr % 16 == 0 and out1_ptr % 16 == 0 and out2_ptr % 16 == 0 and out3_ptr % 16 == 0, "Destination tensors must be 16-byte aligned"
+    assert in0_ptr % 16 == 0 and in1_ptr % 16 == 0 and in2_ptr % 16 == 0 and in3_ptr % 16 == 0, "Source tensors must be 16-byte aligned"
+
+    # Call our C function
+    lib.sideaware_elementwise(kernel_id, num_bytes,
+                                    out0_ptr, out1_ptr, out2_ptr, out3_ptr,
+                                    in0_ptr, in1_ptr, in2_ptr, in3_ptr,
+                                    sideband_ptr, sideband_value, parallel_chunks, forced_sm_per_side,
+                                    torch.cuda.current_device(), torch.cuda.current_stream())
 
 # Manually define the PyTorch operator
-#
-sideaware_lib = torch.library.Library("sideaware", "FRAGMENT")
-
-def direct_register_custom_op(op_name, op_func, mutates_args):
+def direct_register_custom_op(op_lib, op_name, op_func, mutates_args):
     schema_str = torch.library.infer_schema(op_func, mutates_args=mutates_args)
-    sideaware_lib.define(op_name + schema_str)
-    sideaware_lib.impl(op_name, op_func, "CUDA")
+    op_lib.define(op_name + schema_str)
+    op_lib.impl(op_name, op_func, "CUDA")
 
-direct_register_custom_op("memcpy", sideaware_memcpy, mutates_args=(["dst"]))
+sideaware_lib = torch.library.Library("sideaware", "FRAGMENT")
+direct_register_custom_op(sideaware_lib, "memcpy", sideaware_memcpy, mutates_args=(["dst"]))
+direct_register_custom_op(sideaware_lib, "one_to_one", sideaware_one_to_one, mutates_args=(["dst"]))
+direct_register_custom_op(sideaware_lib, "elementwise", sideaware_elementwise, mutates_args=(["out0", "out1", "out2", "out3", "sideband_tensor"]))
 
 # Let's run the new functions
 print("Running SM side detection...")
@@ -127,25 +182,57 @@ print(f"After memcpy - src: {src_tensor[0, 0]} & {src_tensor[9, 9]}, dst: {dst_t
 # ---------------------------------------------------------------------------
 # Demonstrate dynamic header injection & recompilation via NVRTC
 # ---------------------------------------------------------------------------
-print("\nTesting NVRTC dynamic recompilation path (inject custom header)...")
+print("\nTesting NVRTC dynamic recompilation path (custom sideaware kernel)...")
 
-# Prepare a minimal header that adds an unused device helper.  In a real use
-# case this could define e.g. a GELU or ReLU transformation that will be used
-# by an element‑wise kernel variant compiled on‑the‑fly.
-header_code = b"__device__ float dummy_scale(float x) { return x * 1.0f; }\n"
+header_code = b"""
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 
-# Tell the allocator to use the new header for future kernel compilations.
-# The next sideaware_memcpy call will trigger recompilation automatically.
-header_id = alloc_lib.sideaware_set_custom_header(header_code)
+typedef float o0;
+typedef half o1;
+typedef __nv_bfloat16 i0;
+typedef float i1;
 
-src_hdr = torch.arange(16, device="cuda", dtype=torch.float32).reshape(4, 4)
-dst_hdr = torch.zeros_like(src_hdr)
+struct unused {};
+typedef unused o2, o3, i2, i3;
 
-torch.ops.sideaware.memcpy(dst_hdr, src_hdr)
+template<typename size_type>
+__device__ __forceinline__ void elementwise_op(
+        size_type element_idx, o0 &out0, o1 &out1, o2 &out2, o3 &out3,
+        const i0 &in0, const i1 &in1, const i2 &in2, const i3 &in3)
+{
+    out0 = (o0)((float)in0 + (float)in1);
+    out1 = (o1)((float)in1 * 10.0f);
+}
+
+constexpr int unrolled = 4; // unrolled loop iterations (increases register pressure especially with multiple inputs)
+constexpr bool reverse_order = true; // process end of array 1st (maximise L2 hits with normal->reverse->normal->...)
+constexpr bool input_evict[4] = {true, true, true, true}; // do not keep inputs in L2 (more space for outputs)
+
+constexpr bool support_concurrent_kernels = false; // use atomics to dynamically assign SM side index
+constexpr bool input_discard[4] = {0}; // danger: discards from L2 *before* data is written to DRAM
+"""
+
+in0_hdr = torch.arange(64, device="cuda", dtype=torch.float32).reshape(8, 8)
+in1_hdr = torch.ones_like(in0_hdr) * 2
+out0_hdr = torch.zeros_like(in1_hdr)
+out1_hdr = torch.zeros_like(in1_hdr)
+
+in0_hdr = in0_hdr.to(torch.bfloat16)
+out1_hdr = out1_hdr.to(torch.float16)
+
+kernel_id = lib.sideaware_compile(header_code, True)
+torch.ops.sideaware.elementwise(kernel_id, out0_hdr, out1_hdr, None, None, in0_hdr, in1_hdr, None, None, None, 0, 0, 0)
 
 # Verify correctness after recompilation
-assert torch.all(dst_hdr == src_hdr)
-print("Header recompilation successful – memcpy still correct.")
+if not torch.all(out0_hdr == (in0_hdr+in1_hdr)) or not torch.all(out1_hdr == (in1_hdr*10.0)):
+    print("!!!!! Incorrect output for custom elementwise kernel !!!!!")
+    print(f"in0_hdr: {in0_hdr}")
+    print(f"in1_hdr: {in1_hdr}")
+    print(f"out0_hdr: {out0_hdr}")
+    print(f"out1_hdr: {out1_hdr}")
+else:
+    print("Successfully compiled and executed the custom elementwise kernel")
 
 # Test with torch.compile
 @torch.compile(fullgraph=True)
@@ -154,8 +241,8 @@ def compiled_memcpy(dst, src):
     return dst  # We return dst here for convenience in the test function
 
 # Create new tensors for the compiled test
-src2 = torch.ones((5, 5), dtype=torch.float32, device="cuda") * 2.0
-dst2 = torch.zeros((5, 5), dtype=torch.float32, device="cuda")
+src2 = torch.ones((8, 8), dtype=torch.float32, device="cuda") * 2.0
+dst2 = torch.zeros((8, 8), dtype=torch.float32, device="cuda")
 print(f"Before compiled memcpy - src: {src2[0, 0]} & {src2[4, 4]}, dst: {dst2[0, 0]} & {dst2[4, 4]}")
 
 # Call compiled function
@@ -192,9 +279,9 @@ def test_memcpy_correctness(shape, dtype=torch.float32, run_benchmark=False, sta
     """Test correctness of sideaware_memcpy with tensors of given shape and dtype."""
     print(f"\nTesting shape={shape}, dtype={dtype}")
 
-    # Calculate size in MB
+    # Calculate size in MB (not MiB, because bandwidth is typically GB/s rather than GiB/s)
     element_size = torch.empty(1, dtype=dtype).element_size()
-    size_mb = np.prod(shape) * element_size / (1024 * 1024)
+    size_mb = np.prod(shape) * element_size / (1000 * 1000)
     print(f"Tensor size: {size_mb:.2f} MB")
 
     # Create source tensor with recognizable pattern
@@ -209,7 +296,7 @@ def test_memcpy_correctness(shape, dtype=torch.float32, run_benchmark=False, sta
 
     # Copy using our manual memcpy
     if run_benchmark:
-        for i in range(3):
+        for i in range(5):
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
 
@@ -264,6 +351,12 @@ test_memcpy_correctness((10000, 1000), dtype=torch.float32, run_benchmark=True) 
 try:
     test_memcpy_correctness((20000, 20000), dtype=torch.float32, run_benchmark=True)  # ~1600 MB
 except RuntimeError as e:
-    print(f"Skipped largest test due to: {e}")
+    print(f"Skipped large test due to: {e}")
+
+try:
+    test_memcpy_correctness((200000, 20000), dtype=torch.float32, run_benchmark=True)  # ~16000 MB
+except RuntimeError as e:
+    print(f"Skipped large test due to: {e}")
+
 
 print("\n===== MANUAL MEMCPY TESTING COMPLETE =====")
