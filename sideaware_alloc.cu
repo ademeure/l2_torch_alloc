@@ -725,7 +725,7 @@ void fill_sm_sides_tensor(unsigned char* gpu_tensor) {
     cudaError_t err = cudaMemcpy(gpu_tensor, ctx.gpu_side_index, ctx.num_sms, cudaMemcpyDeviceToDevice);
     assert(err == cudaSuccess);
 }
-const int* get_sm_side_summary_ptr()
+const int* get_sm_side_summary()
 {
     DeviceContext& ctx = get_device_context();
     ctx.side_summary[0] = ctx.num_sms;

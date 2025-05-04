@@ -406,9 +406,6 @@ struct DeviceContext {
 // ---------------------------------------------------------------------------
 // Helper Functions & Classes
 // ---------------------------------------------------------------------------
-template<class T>
-constexpr inline T ceil_div(T a, T b) { return (a + b - 1) / b; }
-
 template<class... Ts>
 __device__ __host__ static void debugf(const char* fmt, Ts... args) {
 #ifdef DEBUG_PRINTF
@@ -1297,13 +1294,12 @@ void sideaware_elementwise(int kernel_id,
     cuLaunchKernel(kernel, ctx.num_sms, 1, 1, 256, num_groups, 1, 0, cuStream, args, nullptr);
 }
 
-void sideaware_one_to_one(int kernel_id, size_t num_bytes, void* out0, const void* in0, cudaStream_t stream) {
-    int current_device = get_device_context().device_id;
-    sideaware_elementwise(kernel_id, num_bytes, out0, 0, 0, 0, in0, 0, 0, 0, 0, 0, 0, 0, current_device, stream);
+void sideaware_one_to_one(int kernel_id, size_t num_bytes, void* out0, const void* in0, int device, cudaStream_t stream) {
+    sideaware_elementwise(kernel_id, num_bytes, out0, 0, 0, 0, in0, 0, 0, 0, 0, 0, 0, 0, device, stream);
 }
 
-void sideaware_memcpy(void* out, const void* in, size_t num_bytes, int current_device, cudaStream_t stream) {
-    sideaware_elementwise(0, num_bytes, out, 0, 0, 0, in, 0, 0, 0, 0, 0, 0, 0, current_device, stream);
+void sideaware_memcpy(void* out, const void* in, size_t num_bytes, int device, cudaStream_t stream) {
+    sideaware_elementwise(0, num_bytes, out, 0, 0, 0, in, 0, 0, 0, 0, 0, 0, 0, device, stream);
 }
 
 // ---------------------------------------------------------------------------
@@ -1374,7 +1370,7 @@ void fill_sm_sides_tensor(unsigned char* gpu_tensor) {
     assert(err == cudaSuccess);
 }
 
-const int* get_sm_side_summary_ptr()
+const int* get_sm_side_summary()
 {
     DeviceContext& ctx = get_device_context();
     ctx.side_summary[0] = ctx.num_sms;
