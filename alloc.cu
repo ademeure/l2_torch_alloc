@@ -302,6 +302,7 @@ extern "C" __global__ LAUNCH_BOUNDS void KERNEL_NAME(
 //#define DEBUG_PRINTF
 constexpr bool   ALWAYS_OUTPUT_SASS = false;   // always output assembly to "sass" file (even if filename is empty)
 constexpr bool   ALWAYS_TRY_CUDA_FREE = true;  // cudaFreeAsync for unknown pointers (e.g. if alloc threshold changes)
+constexpr bool   ALWAYS_SET_DEVICE = true;     // ScopedSetDevice to set & restore device (is this really necesssary?)
 constexpr int    DEFAULT_PARALLEL_CHUNKS = 4;  // number of 256 threads "groups" (blockDim.y) per SM (max 4 on H100)
 constexpr bool   SYNC_ON_EVERY_ALLOC = false;  // sync when (pre)allocating memory to avoid confusing async errors
 constexpr bool   ZERO_ON_PREALLOC = false;     // zero out memory when preallocating physical memory
@@ -521,13 +522,13 @@ static CUmodule loadCUBIN(char *cubin, CUdevice cuDevice, bool free_cubin=true) 
 class ScopedSetDevice {
 public:
     explicit ScopedSetDevice(int new_device) {
-        if (g_num_devices != 1) {
+        if (g_num_devices != 1 && ALWAYS_SET_DEVICE) {
             cudaGetDevice(&old_device);
             cudaSetDevice(new_device);
         }
     }
     ~ScopedSetDevice() {
-        if (g_num_devices != 1) {
+        if (g_num_devices != 1 && ALWAYS_SET_DEVICE) {
             cudaSetDevice(old_device);
         }
     }
