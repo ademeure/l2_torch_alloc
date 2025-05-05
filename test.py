@@ -16,22 +16,22 @@ lib.sideaware_compile.restype = ctypes.c_int
 lib.get_sm_side_summary.argtypes = []
 lib.get_sm_side_summary.restype = ctypes.POINTER(ctypes.c_int * 5)
 lib.fill_sm_sides_tensor.argtypes = [ctypes.c_void_p]
-lib.fill_sm_sides_tensor.restype = ctypes.c_bool
+lib.fill_sm_sides_tensor.restype = []
 
 lib.sideaware_memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
 lib.sideaware_memcpy.restype = None
-lib.sideaware_one_to_one.argtypes = [ctypes.c_int, ctypes.c_size_t, # kernel_id, num_bytes
-                                           ctypes.c_void_p, ctypes.c_void_p, # out0, in0
-                                           ctypes.c_int, ctypes.c_void_p] # device, stream
+lib.sideaware_one_to_one.argtypes = [ctypes.c_int, ctypes.c_size_t,     # kernel_id, num_bytes
+                                     ctypes.c_void_p, ctypes.c_void_p,  # out0, in0
+                                     ctypes.c_int, ctypes.c_void_p]     # device, stream
 lib.sideaware_one_to_one.restype = None
-lib.sideaware_elementwise.argtypes = [ctypes.c_int, ctypes.c_size_t, # kernel_id, num_bytes
+lib.sideaware_elementwise.argtypes = [ctypes.c_int, ctypes.c_size_t,    # kernel_id, num_bytes
                                       ctypes.c_void_p, ctypes.c_void_p, # out0, out1
                                       ctypes.c_void_p, ctypes.c_void_p, # out2, out3
                                       ctypes.c_void_p, ctypes.c_void_p, # in0, in1
                                       ctypes.c_void_p, ctypes.c_void_p, # in2, in3
                                       ctypes.c_void_p, ctypes.c_void_p, # sideband_ptr, sideband_value
-                                      ctypes.c_int, ctypes.c_int, # parallel_chunks, forced_sm_per_side
-                                      ctypes.c_int, ctypes.c_void_p] # device, stream
+                                      ctypes.c_int, ctypes.c_int,       # parallel_chunks, forced_sm_per_side
+                                      ctypes.c_int, ctypes.c_void_p]    # device, stream
 lib.sideaware_elementwise.restype = None
 
 # ---------------------------------------------------------------------------

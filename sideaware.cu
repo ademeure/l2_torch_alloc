@@ -1414,13 +1414,26 @@ void set_free_mapped_thresholds(size_t start_threshold, size_t end_threshold) {
     g_free_mapped_end_threshold = end_threshold;
 }
 
+void set_sass_filename(const char* filename) {
+    g_sass_filename = std::string(filename);
+}
+
 // ---------------------------------------------------------------------------
 // Query functions
 // ---------------------------------------------------------------------------
-void fill_sm_sides_tensor(unsigned char* gpu_tensor) {
+void fill_gpu_side_index(unsigned char* gpu_array) {
     DeviceContext& ctx = get_device_context();
-    cudaError_t err = cudaMemcpy(gpu_tensor, ctx.gpu_side_index, ctx.num_sms, cudaMemcpyDeviceToDevice);
-    assert(err == cudaSuccess);
+    assert(cudaMemcpy(gpu_array, ctx.gpu_side_index, ctx.num_sms, cudaMemcpyDeviceToDevice) == cudaSuccess);
+}
+
+const char* get_gpu_side_index() {
+    DeviceContext& ctx = get_device_context();
+    return (const char*)ctx.gpu_side_index;
+}
+
+const char* get_cpu_side_index() {
+    DeviceContext& ctx = get_device_context();
+    return (const char*)ctx.cpu_side_index;
 }
 
 const int* get_sm_side_summary()
@@ -1430,7 +1443,7 @@ const int* get_sm_side_summary()
     ctx.side_summary[1] = ctx.cpu_side_info[OFFSET_NUM_SM_SIDE0];
     ctx.side_summary[2] = ctx.cpu_side_info[OFFSET_NUM_SM_SIDE1];
     ctx.side_summary[3] = ctx.cpu_side_info[OFFSET_MIN_SM_PER_SIDE];
-    ctx.side_summary[4] = ctx.cpu_side_info[OFFSET_SIDE_HASH_MASK];
+    ctx.side_summary[4] = ctx.cpu_side_info[OFFSET_SIDE_HASH_MASK] | (1 << SIDE_HASH_BIT);
     return ctx.side_summary;
 }
 
