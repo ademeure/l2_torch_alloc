@@ -1,8 +1,8 @@
 // ============================================================================
-// Subset of sideaware.cu memory allocation for a single device
+// Subset of sideaware.cu memory allocation for a single GPU (not fully tested)
 // This is all you need to integrate for your custom CUDA project (non-PyTorch)
 // For kernels, look at sideaware_memcpy.cu which includes sideaware_kernel.cuh
-// https://github.com/ademeure/l2_torch_alloc
+// https://github.com/ademeure/cuda_side_boost
 // ============================================================================
 #include <cassert>
 #include <cstring>
@@ -23,7 +23,6 @@
 // Compile Time Settings
 // ---------------------------------------------------------------------------
 //#define DEBUG_PRINTF
-constexpr bool   IGNORE_UNKNOWN_FREE = false;  // if false, assert when trying to free an unknown pointer
 constexpr bool   SYNC_ON_EVERY_ALLOC = false;  // sync when (pre)allocating memory to avoid confusing async errors
 constexpr bool   ZERO_ON_PREALLOC = false;     // zero out memory when preallocating physical memory
 
@@ -119,6 +118,8 @@ __device__ __host__ static void debugf(const char* fmt, Ts... args) {
 
 // ---------------------------------------------------------------------------
 // Device functions & kernels for side info
+// See the following example for simpler code with more comments:
+// https://github.com/ademeure/QuickRunCUDA/blob/main/tests/side_aware.cu
 // ---------------------------------------------------------------------------
 __device__ __forceinline__ int test_latency_l2(unsigned int* data, size_t offset) {
     unsigned int old_value = atomicExch(&data[offset], 0); // also warms up the cache!
@@ -237,7 +238,6 @@ static DeviceContext& get_device_context() {
     return g_deviceContext;
 }
 
-// Query the device allocation constraints
 static void init_allocation_constraints(DeviceContext& ctx)
 {
     int comp_available;
@@ -258,18 +258,6 @@ static void init_allocation_constraints(DeviceContext& ctx)
         res = cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
         assert(res == CUDA_SUCCESS && granularity == PAGE_SIZE);
     }
-}
-
-static CUmemAllocationProp get_allocation_constraints(DeviceContext& ctx, bool compression=false)
-{
-    compression &= ctx.compression_available;
-
-    CUmemAllocationProp prop = {};
-    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id = 0;
-    prop.allocFlags.compressionType = compression ? CU_MEM_ALLOCATION_COMP_GENERIC : 0;
-    return prop;
 }
 
 void DeviceContext::initialize() {
@@ -363,7 +351,12 @@ static size_t release_unused_memory() {
 // ---------------------------------------------------------------------------
 static CUresult sideaware_preallocate(DeviceContext& ctx, int countNeeded, bool compression, cudaStream_t stream)
 {
-    CUmemAllocationProp prop = get_allocation_constraints(ctx, compression);
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = 0;
+    prop.allocFlags.compressionType = compression ? CU_MEM_ALLOCATION_COMP_GENERIC : 0;
+
     CUresult lastError = CUDA_SUCCESS;
     int totalAllocated = 0;
 
@@ -676,21 +669,21 @@ static void* sideaware_malloc_large(DeviceContext& ctx, size_t size, cudaStream_
     return sideaware_try_allocate(ctx, size, stream);
 }
 
-static void sideaware_free_large(DeviceContext& ctx, void* ptr, cudaStream_t stream)
+static cudaError_t sideaware_free_large(DeviceContext& ctx, void* ptr, cudaStream_t stream, bool try_cuda_free = false)
 {
-    if (!ptr) return;
+    if (!ptr) return cudaSuccess;
     auto it = ctx.large_alloc_registry.find(ptr);
     if (it == ctx.large_alloc_registry.end()) {
-        printf("ERROR: Failed to find large allocation %p to free\n", ptr);
-        assert(IGNORE_UNKNOWN_FREE);
-        return;
+        return cudaErrorUnknown;
     }
 
     LargeAllocInfo info = it->second;
     ctx.large_alloc_registry.erase(it);
     ctx.large_alloc_cache[info.aligned_size + (int)info.use_compression].push_back(info);
     ctx.total_mapped_free += info.aligned_size;
+    return cudaSuccess;
 }
+
 
 // ---------------------------------------------------------------------------
 // PUBLIC API
@@ -698,48 +691,62 @@ static void sideaware_free_large(DeviceContext& ctx, void* ptr, cudaStream_t str
 extern "C" {
 
 // Memory allocation functions
-void* sideaware_malloc(size_t size, cudaStream_t stream) {
-    debugf("sideaware_malloc(%zu, %p)\n", size, stream);
-    return sideaware_malloc_large(get_device_context(), size, stream);
+cudaError_t sideaware_malloc_async(void** devPtr, size_t size, cudaStream_t stream) {
+    debugf("sideaware_malloc_async(%zu, %p)\n", size, stream);
+    *devPtr = sideaware_malloc_large(get_device_context(), size, stream);
+    return (*devPtr) ? cudaSuccess : cudaErrorMemoryAllocation;
 }
-void sideaware_free(void* ptr, cudaStream_t stream) {
-    debugf("sideaware_free(%p, %p)\n", ptr, stream);
-    sideaware_free_large(get_device_context(), ptr, stream);
+
+cudaError_t sideaware_free_async(void* ptr, cudaStream_t stream) {
+    debugf("sideaware_free_async(%p, %p)\n", ptr, stream);
+    return sideaware_free_large(get_device_context(), ptr, stream);
+}
+
+// Synchronous memory allocation (usually better to use async)
+cudaError_t sideaware_malloc(void** devPtr, size_t size) {
+    debugf("sideaware_malloc(%zu)\n", size);
+
+    assert(cudaDeviceSynchronize() == cudaSuccess);
+    *devPtr = sideaware_malloc_large(get_device_context(), size, 0);
+
+    return (*devPtr) ? cudaSuccess : cudaErrorMemoryAllocation;
+}
+cudaError_t sideaware_free(void* ptr) {
+    debugf("sideaware_free(%p)\n", ptr);
+    assert(cudaDeviceSynchronize() == cudaSuccess);
+    return sideaware_free_large(get_device_context(), ptr, 0);
 }
 size_t sideaware_release_unused() {
     return release_unused_memory();
 }
 
 // Configuration functions
-void use_compression(bool value) {
-    g_use_compression = value;
+void sideaware_compression(bool enable) {
+    g_use_compression = enable;
 }
-void set_prealloc_config(int extra_required, int extra_alloc) {
+void sideaware_prealloc_config(int extra_required, int extra_alloc) {
     g_prealloc_extra_required = extra_required;
     g_prealloc_extra_alloc = extra_alloc;
 }
-void set_free_mapped_thresholds(size_t start_threshold, size_t end_threshold) {
+void sideaware_free_mapped_thresholds(size_t start_threshold, size_t end_threshold) {
     g_free_mapped_start_threshold = start_threshold;
     g_free_mapped_end_threshold = end_threshold;
 }
-void set_sass_filename(const char* filename) {
-    g_sass_filename = std::string(filename);
-}
 
 // Query functions
-void fill_gpu_side_index(unsigned char* gpu_array) {
+void sideaware_fill_side_index(unsigned char* gpu_array) {
     DeviceContext& ctx = get_device_context();
     assert(cudaMemcpy(gpu_array, ctx.gpu_side_index, ctx.num_sms, cudaMemcpyDeviceToDevice) == cudaSuccess);
 }
-const char* get_gpu_side_index() {
+const char* sideaware_gpu_side_index() {
     DeviceContext& ctx = get_device_context();
     return (const char*)ctx.gpu_side_index;
 }
-const char* get_cpu_side_index() {
+const char* sideaware_cpu_side_index() {
     DeviceContext& ctx = get_device_context();
-    return (const char*)ctx.cpu_side_index;
+    return (const char*)ctx.param_sm_side.side_index;
 }
-const int* get_sm_side_summary()
+const int* sideaware_sm_side_summary()
 {
     DeviceContext& ctx = get_device_context();
     ctx.side_summary[0] = ctx.num_sms;
@@ -749,10 +756,10 @@ const int* get_sm_side_summary()
     ctx.side_summary[4] = ctx.cpu_side_info[OFFSET_SIDE_HASH_MASK] | (1 << SIDE_HASH_BIT);
     return ctx.side_summary;
 }
-int get_num_sms() { return get_device_context().num_sms; }
-int get_num_sm_side0() { return get_device_context().cpu_side_info[OFFSET_NUM_SM_SIDE0]; }
-int get_num_sm_side1() { return get_device_context().cpu_side_info[OFFSET_NUM_SM_SIDE1]; }
-int get_min_sm_per_side() { return get_device_context().cpu_side_info[OFFSET_MIN_SM_PER_SIDE]; }
-int get_hash_mask() { return get_device_context().cpu_side_info[OFFSET_SIDE_HASH_MASK]; }
+int sideaware_num_sms() { return get_device_context().num_sms; }
+int sideaware_num_sm_side0() { return get_device_context().cpu_side_info[OFFSET_NUM_SM_SIDE0]; }
+int sideaware_num_sm_side1() { return get_device_context().cpu_side_info[OFFSET_NUM_SM_SIDE1]; }
+int sideaware_min_sm_per_side() { return get_device_context().cpu_side_info[OFFSET_MIN_SM_PER_SIDE]; }
+int sideaware_hash_mask() { return get_device_context().cpu_side_info[OFFSET_SIDE_HASH_MASK] | (1 << SIDE_HASH_BIT); }
 
 } // extern "C"

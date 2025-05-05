@@ -8,9 +8,17 @@
 #ifndef KERNEL_NAME
 #define KERNEL_NAME sideaware_elementwise
 #endif
-#ifndef LAUNCH_BOUNDS
-#define LAUNCH_BOUNDS __launch_bounds__(1024, 1)
+
+#ifndef UNROLLED
+#define UNROLLED 4 // unrolled loop iterations (increases register pressure especially with multiple inputs)
 #endif
+#ifndef LAUNCH_BOUNDS
+#define LAUNCH_BOUNDS __launch_bounds__(1024, 1) // (1024,1) ==>> compiler must use less than 64 registers
+#endif
+#ifndef DISCARD_INPUTS
+constexpr bool input_discard[4] = {0,0,0,0}; // danger: discards from L2 *before* data is written to DRAM
+#endif
+
 #ifndef FORCE_WRONG_SIDE
 #define FORCE_WRONG_SIDE false
 #endif
@@ -18,18 +26,37 @@
 #define FORCE_RANDOM_SIDE false
 #endif
 
+//#define DYNAMIC_INDEX_FOR_CONCURRENT_KERNELS // use atomics to dynamically assign SM side index
+//#define CUSTOM_VECTOR_OP // custom vector_op() instead of elementwise_op()
+//#define CUSTOM_IDX_FUNC
+
 // Typically only need custom elementwise_op, but support custom vector_op if needed
 // e.g. for BF16 -> MXFP8 with microscaling where we need the absmax over 32 elements
 // (in theory, we have access to 512 bytes per warp and 4096 bytes per group with barriers)
 #ifndef CUSTOM_VECTOR_OP
-template<typename size_type>
-__device__ void vector_op(size_type idx, int vec_size,
+__device__ void vector_op(size_type vec_idx, int vec_size,
                           o0 *out0, o1 *out1, o2 *out2, o3 *out3,
                           const i0 *in0, const i1 *in1, const i2 *in2, const i3 *in3,
                           int* sideband_memory, int sideband_value) {
     for (int i = 0; i < vec_size; i++) {
-        elementwise_op(idx * vec_size + i, out0[i], out1[i], out2[i], out3[i], in0[i], in1[i], in2[i], in3[i]);
+        elementwise_op(vec_idx * vec_size + i, sideband_value,
+                       out0[i], out1[i], out2[i], out3[i],
+                       in0[i], in1[i], in2[i], in3[i]);
     }
+}
+#endif
+
+// This allows complex indexing (not 1:1) as long it can be determinally statically
+// e.g. RoPE will have a dynamic non-linear index for i1 based on vec_idx/vec_size only
+#ifndef CUSTOM_IDX_FUNC
+__device__ bool indexing(size_type vec_idx, int vec_size,
+                         size_type &idx_i0, size_type &idx_i1, size_type &idx_i2, size_type &idx_i3,
+                         int* sideband_memory, int sideband_value) {
+    idx_i0 = vec_idx;
+    idx_i1 = vec_idx;
+    idx_i2 = vec_idx;
+    idx_i3 = vec_idx;
+    return false; // do not skip
 }
 #endif
 
@@ -81,7 +108,7 @@ __device__ __forceinline__ T load(const T * __restrict__ src) {
 }
 
 // Automatically use vector stores (assumes pointer is aligned, otherwise it's an illegal memory access)
-template<bool evict = false, typename T>
+template<bool writeback = true, typename T> // TODO: cache streaming support for outputs
 __device__ __forceinline__ void store(T* __restrict__ ptr, const T &value) {
     T* aligned_ptr = (T*)__builtin_assume_aligned(ptr, sizeof(T));
     aligned_ptr[0] = value;
@@ -133,37 +160,35 @@ extern "C" __global__ LAUNCH_BOUNDS void KERNEL_NAME(
     unsigned int sm_side = params.side_index[smid] & 1;
     unsigned int sm_side_index;
 
-    if constexpr (support_concurrent_kernels == false) {
-        // Static side index (determined at init time at the same time as detecting the side of each SM)
-        // Only works if all SMs are available and gridDim == SM count, otherwise some data might be skipped
-        sm_side_index = params.side_index[smid] >> 1;
+    // Static side index (determined at init time at the same time as detecting the side of each SM)
+    // Only works if all SMs are available and gridDim == SM count, otherwise some data might be skipped
+    sm_side_index = params.side_index[smid] >> 1;
+
+    #ifdef DYNAMIC_INDEX_FOR_CONCURRENT_KERNELS
+    // Dynamic side index using atomics (always works and only significantly slower when static would fail)
+    __shared__ unsigned int shared_sm_side_index;
+    if (threadIdx.x == 0 && threadIdx.y == 0) {
+        sm_side_index = atomicInc(&zeroed_scratch_buffer[sm_side], 999);
         if (sm_side_index >= num_sm_per_side) {
-            return;
-        }
-    } else {
-        // Dynamic side index using atomics (always works)
-        __shared__ unsigned int shared_sm_side_index;
-        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            sm_side = 1 - sm_side; // need to process the 'wrong side' or no one will (slower but safer)
             sm_side_index = atomicInc(&zeroed_scratch_buffer[sm_side], 999);
-            if (sm_side_index >= num_sm_per_side) {
-                sm_side = 1 - sm_side; // need to process the 'wrong side' or no one will (slower but safer)
-                sm_side_index = atomicInc(&zeroed_scratch_buffer[sm_side], 999);
-            }
-            unsigned int total_both_sides = atomicInc(&zeroed_scratch_buffer[2], 999);
-            if (total_both_sides >= gridDim.x - 1) {
-                // Reset the counter for the next kernel launch
-                // (cycle through multiple buffers to support kernels running in parallel)
-                zeroed_scratch_buffer[0] = 0;
-                zeroed_scratch_buffer[1] = 0;
-                zeroed_scratch_buffer[2] = 0;
-            }
-            shared_sm_side_index = sm_side_index;
         }
-        __syncthreads();
-        sm_side_index = shared_sm_side_index;
-        if (sm_side_index >= num_sm_per_side) {
-            return;
+        unsigned int total_both_sides = atomicInc(&zeroed_scratch_buffer[2], 999);
+        if (total_both_sides >= gridDim.x - 1) {
+            // Reset the counter for the next kernel launch
+            // (cycle through multiple buffers to support kernels running in parallel)
+            zeroed_scratch_buffer[0] = 0;
+            zeroed_scratch_buffer[1] = 0;
+            zeroed_scratch_buffer[2] = 0;
         }
+        shared_sm_side_index = sm_side_index;
+    }
+    __syncthreads();
+    sm_side_index = shared_sm_side_index;
+    #endif
+
+    if (sm_side_index >= num_sm_per_side) {
+        return;
     }
 
     // Side calculation: if 2MiB aligned, we don't need a base if we adjust the side based on bit 21 (4MiB unaligned)
@@ -181,9 +206,9 @@ extern "C" __global__ LAUNCH_BOUNDS void KERNEL_NAME(
     // Chunks
     constexpr int CHUNK_OFFSET = 4096 / vector_bytes;
     constexpr int DOUBLE_CHUNK_OFFSET = 2 * CHUNK_OFFSET;
-    constexpr size_type MULTI_CHUNK_OFFSET = unrolled * DOUBLE_CHUNK_OFFSET;
+    constexpr size_type MULTI_CHUNK_OFFSET = UNROLLED * DOUBLE_CHUNK_OFFSET;
     int num_double_chunks = num_vectors_16B / (size_type)DOUBLE_CHUNK_OFFSET;
-    int multi_chunks = num_double_chunks / unrolled;
+    int multi_chunks = num_double_chunks / UNROLLED;
 
     // Groups and indices
     // Up to 4 groups (blockDim.y) of 256 threads each (blockDim.x)
@@ -199,11 +224,12 @@ extern "C" __global__ LAUNCH_BOUNDS void KERNEL_NAME(
     size_type offset_increment_outer = (MULTI_CHUNK_OFFSET * groups_per_side) * (reverse_order ? -1 : 1);
 
     // Loop variables (worst case register pressure is very roughly all of this live at the same time)
-    size_type offsets[unrolled];
-    vi0 in0[unrolled];
-    vi1 in1[unrolled];
-    vi2 in2[unrolled];
-    vi3 in3[unrolled];
+    size_type offsets[UNROLLED];
+    bool skip[UNROLLED];
+    vi0 in0[UNROLLED];
+    vi1 in1[UNROLLED];
+    vi2 in2[UNROLLED];
+    vi3 in3[UNROLLED];
     vo0 out0;
     vo1 out1;
     vo2 out2;
@@ -211,8 +237,8 @@ extern "C" __global__ LAUNCH_BOUNDS void KERNEL_NAME(
 
     #pragma unroll 1
     for (int i = global_idx; i < multi_chunks; i += groups_per_side, global_offset += offset_increment_outer) {
-        #pragma unroll unrolled
-        for (int j = 0; j < unrolled; j++) {
+        #pragma unroll UNROLLED
+        for (int j = 0; j < UNROLLED; j++) {
             size_type offset = global_offset + (j * DOUBLE_CHUNK_OFFSET);
 
             // Determine the side of the 1st 4KiB chunk in this 8KiB "double chunk"
@@ -231,42 +257,54 @@ extern "C" __global__ LAUNCH_BOUNDS void KERNEL_NAME(
             offset += (use_second_chunk * CHUNK_OFFSET);
 
             offsets[j] = offset;
-            in0[j] = load<input_evict[0]>(input0 + offset);
-            in1[j] = load<input_evict[1]>(input1 + offset);
-            in2[j] = load<input_evict[2]>(input2 + offset);
-            in3[j] = load<input_evict[3]>(input3 + offset);
+            size_type offsets_i[4] = {0};
+            skip[j] = indexing(offset, vec_size, offsets_i[0], offsets_i[1], offsets_i[2], offsets_i[3], mem, val);
+
+            if (skip[j] == false) {
+                in0[j] = load<input_evict[0]>(input0 + offsets_i[0]);
+                in1[j] = load<input_evict[1]>(input1 + offsets_i[1]);
+                in2[j] = load<input_evict[2]>(input2 + offsets_i[2]);
+                in3[j] = load<input_evict[3]>(input3 + offsets_i[3]);
+            }
         }
 
-        // Execute operation and store results *after* the loads for every unrolled iteration
+        // Execute operation and store results *after* the loads for every UNROLLED iteration
         // In theory, the compiler should be able to reorder things to maximise memory parallelism either way...
         // In practice, this is the only way to get it to reliably do the right thing (all indexing is optimized away)
-        #pragma unroll unrolled
-        for (int j = 0; j < unrolled; j++) {
-            size_type offset = offsets[j];
-            vector_op(offset, vec_size, +out0, +out1, +out2, +out3, +in0[j], +in1[j], +in2[j], +in3[j], mem, val);
-            store(output0 + offset, out0);
-            store(output1 + offset, out1);
-            store(output2 + offset, out2);
-            store(output3 + offset, out3);
+        #pragma unroll UNROLLED
+        for (int j = 0; j < UNROLLED; j++) {
+            if (skip[j] == false) {
+                size_type offset = offsets[j];
+                vector_op(offset, vec_size, +out0, +out1, +out2, +out3, +in0[j], +in1[j], +in2[j], +in3[j], mem, val);
+                store(output0 + offset, out0);
+                store(output1 + offset, out1);
+                store(output2 + offset, out2);
+                store(output3 + offset, out3);
+            }
         }
 
         // Optional discard needs to happen after the stores otherwise performance is extremely bad (due to fences?)
-        #pragma unroll unrolled
-        for (int j = 0; j < unrolled; j++) {
-            size_type offset = offsets[j];
-            discard_inputs(input0 + offset, input1 + offset, input2 + offset, input3 + offset);
+        #ifdef DISCARD_INPUTS
+        #pragma unroll UNROLLED
+        for (int j = 0; j < UNROLLED; j++) {
+            if (skip[j] == false) {
+                size_type offsets_i[4] = {0};
+                indexing(offsets[j], vec_size, offsets_i[0], offsets_i[1], offsets_i[2], offsets_i[3], mem, val);
+                discard_inputs(input0+offsets_i[0], input1+offsets_i[1], input2+offsets_i[2], input3+offsets_i[3]);
+            }
         }
+        #endif
     }
 
-    // Handle everything that isn't a multiple of MULTI_CHUNK_OFFSET (i.e. 32KiB with unrolled = 4)
+    // Handle everything that isn't a multiple of MULTI_CHUNK_OFFSET (i.e. 32KiB with UNROLLED = 4)
     // Try to process this on the 'last SMs' that are most likely to require one less 'full' iteration
     // Worst case we need 8 SMs (4 per side) to process 32KiB so we don't need more than 1 group per SM
     if (group == 0) {
-        int max_remaining_double_chunks = (num_double_chunks + 1) - (multi_chunks * unrolled);
+        int max_remaining_double_chunks = (num_double_chunks + 1) - (multi_chunks * UNROLLED);
         int start_sm_side_idx = num_sm_per_side - max_remaining_double_chunks;
         int idx = sm_side_index - start_sm_side_idx;
         if (idx >= 0) {
-            size_type offset = (size_type)(idx + multi_chunks * unrolled) * DOUBLE_CHUNK_OFFSET;
+            size_type offset = (size_type)(idx + multi_chunks * UNROLLED) * DOUBLE_CHUNK_OFFSET;
             offset += group_tid_offset;
 
             unsigned int lsb_bits = base + (offset & 0xFFFFFFFF);
@@ -275,20 +313,26 @@ extern "C" __global__ LAUNCH_BOUNDS void KERNEL_NAME(
             offset += (use_second_chunk * CHUNK_OFFSET);
 
             if (offset < num_vectors_16B) {
-                in0[0] = load<input_evict[0]>(input0 + offset);
-                in1[0] = load<input_evict[1]>(input1 + offset);
-                in2[0] = load<input_evict[2]>(input2 + offset);
-                in3[0] = load<input_evict[3]>(input3 + offset);
+                size_type offsets_i[4] = {0};
+                skip[0] = indexing(offset, vec_size, offsets_i[0], offsets_i[1], offsets_i[2], offsets_i[3], mem, val);
+                if (skip[0]) {
+                    return;
+                }
+
+                in0[0] = load<input_evict[0]>(input0 + offsets_i[0]);
+                in1[0] = load<input_evict[1]>(input1 + offsets_i[1]);
+                in2[0] = load<input_evict[2]>(input2 + offsets_i[2]);
+                in3[0] = load<input_evict[3]>(input3 + offsets_i[3]);
 
                 vector_op(offset, vec_size, +out0, +out1, +out2, +out3, +in0[0], +in1[0], +in2[0], +in3[0], mem, val);
                 store(output0 + offset, out0);
                 store(output1 + offset, out1);
                 store(output2 + offset, out2);
                 store(output3 + offset, out3);
-                discard_inputs(input0 + offset, input1 + offset, input2 + offset, input3 + offset);
+                #ifdef DISCARD_INPUTS
+                discard_inputs(input0+offsets_i[0], input1+offsets_i[1], input2+offsets_i[2], input3+offsets_i[3]);
+                #endif
             }
         }
     }
 }
-
-#undef KERNEL_NAME

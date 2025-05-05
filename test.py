@@ -1,5 +1,9 @@
 # ---------------------------------------------------------------------------
-# https://github.com/ademeure/l2_torch_alloc
+# Extremely non-exhaustive test.py for sideaware.cu
+# Somewhat useful as an example of how to use with PyTorch
+# See DeeperGEMM and sideaware_wrapper.py for another example
+# ---------------------------------------------------------------------------
+# https://github.com/ademeure/cuda-side-boost
 # ---------------------------------------------------------------------------
 import torch
 import ctypes
@@ -11,12 +15,12 @@ sideaware_alloc = torch.cuda.memory.CUDAPluggableAllocator('./sideaware.so', 'si
 torch.cuda.memory.change_current_allocator(sideaware_alloc)
 lib = ctypes.CDLL('./sideaware.so')
 
-lib.sideaware_compile.argtypes = [ctypes.c_char_p, ctypes.c_bool]
-lib.sideaware_compile.restype = ctypes.c_int
-lib.get_sm_side_summary.argtypes = []
-lib.get_sm_side_summary.restype = ctypes.POINTER(ctypes.c_int * 5)
-lib.fill_sm_sides_tensor.argtypes = [ctypes.c_void_p]
-lib.fill_sm_sides_tensor.restype = []
+lib.sideaware_create_kernel.argtypes = [ctypes.c_char_p]
+lib.sideaware_create_kernel.restype = ctypes.c_int
+lib.sideaware_sm_side_summary.argtypes = []
+lib.sideaware_sm_side_summary.restype = ctypes.POINTER(ctypes.c_int * 5)
+lib.sideaware_fill_side_index.argtypes = [ctypes.c_void_p]
+lib.sideaware_fill_side_index.restype = None
 
 lib.sideaware_memcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p]
 lib.sideaware_memcpy.restype = None
@@ -38,12 +42,12 @@ lib.sideaware_elementwise.restype = None
 # Wrappers for compiling sideaware kernels & fetching metadata
 # ---------------------------------------------------------------------------
 # Compile custom elementwise kernel (returns id for sideaware_elementwise)
-def sideaware_compile(header_code: bytes, force_recompile: bool = True) -> int:
-    return lib.sideaware_compile(header_code, force_recompile)
+def sideaware_create_kernel(header_code: bytes) -> int:
+    return lib.sideaware_create_kernel(header_code)
 
 # Returns (num_sms, num_side0, num_side1, min_sm_per_side, hash_mask)
 def sideaware_summary():
-    return tuple(lib.get_sm_side_summary().contents)
+    return tuple(lib.sideaware_sm_side_summary().contents)
 
 # User friendly version of sideaware_summary()
 def sideaware_summary_str():
@@ -55,7 +59,7 @@ def sideaware_side_index_tensor():
     num_sms, _, _, _, _ = sideaware_summary()
     sides_tensor = torch.zeros(num_sms, dtype=torch.uint8, device="cuda")
     tensor_ptr = sides_tensor.data_ptr()
-    lib.fill_sm_sides_tensor(tensor_ptr)
+    lib.sideaware_fill_side_index(tensor_ptr)
     return sides_tensor
 
 # ---------------------------------------------------------------------------
@@ -196,21 +200,19 @@ typedef float i1;
 struct unused {};
 typedef unused o2, o3, i2, i3;
 
-template<typename size_type>
-__device__ __forceinline__ void elementwise_op(
-        size_type element_idx, o0 &out0, o1 &out1, o2 &out2, o3 &out3,
-        const i0 &in0, const i1 &in1, const i2 &in2, const i3 &in3)
+__device__ void elementwise_op(size_t element_idx, int sideband,
+                               o0 &out0, o1 &out1, o2 &out2, o3 &out3,
+                               const i0 &in0, const i1 &in1, const i2 &in2, const i3 &in3)
 {
     out0 = (o0)((float)in0 + (float)in1);
     out1 = (o1)((float)in1 * 10.0f);
 }
 
-constexpr int unrolled = 4; // unrolled loop iterations (increases register pressure especially with multiple inputs)
-constexpr bool reverse_order = true; // process end of array 1st (maximise L2 hits with normal->reverse->normal->...)
-constexpr bool input_evict[4] = {true, true, true, true}; // do not keep inputs in L2 (more space for outputs)
+// process end of array 1st (maximise L2 hits with normal->reverse->normal->...)
+constexpr bool reverse_order = true;
 
-constexpr bool support_concurrent_kernels = false; // use atomics to dynamically assign SM side index
-constexpr bool input_discard[4] = {0}; // danger: discards from L2 *before* data is written to DRAM
+// do not keep inputs in L2 (more space for outputs)
+constexpr bool input_evict[4] = {1,1,1,1};
 """
 
 in0_hdr = torch.arange(64, device="cuda", dtype=torch.float32).reshape(8, 8)
@@ -221,7 +223,7 @@ out1_hdr = torch.zeros_like(in1_hdr)
 in0_hdr = in0_hdr.to(torch.bfloat16)
 out1_hdr = out1_hdr.to(torch.float16)
 
-kernel_id = sideaware_compile(header_code)
+kernel_id = sideaware_create_kernel(header_code)
 torch.ops.sideaware.elementwise(kernel_id, out0_hdr, out1_hdr, None, None, in0_hdr, in1_hdr, None, None, None, 0, 0, 0)
 
 # Verify correctness after recompilation
@@ -238,7 +240,7 @@ else:
 # Benchmark and validate sideaware_memcpy
 # TODO: more exhaustive tests including sideaware_elementwise
 # ---------------------------------------------------------------------------
-print("\n===== COMPREHENSIVE MANUAL MEMCPY TESTING =====")
+print("\n===== MANUAL MEMCPY TESTING =====")
 
 def test_memcpy_correctness(shape, dtype=torch.float32, run_benchmark=False, start_idx=0):
     """Test correctness of sideaware_memcpy with tensors of given shape and dtype."""
